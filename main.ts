@@ -132,10 +132,14 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       id: "sync-configured-vault-content-to-webdav",
       name: "Sync vault content to WebDAV",
       callback: () => {
-        void this.processPendingTasks();
-        void this.syncConfiguredVaultContent(true);
+        void this.runManualSync();
       },
     });
+
+    const ribbon = this.addRibbonIcon("refresh-cw", this.t("立即同步到 WebDAV", "Sync to WebDAV now"), () => {
+      void this.runManualSync();
+    });
+    ribbon.addClass("secure-webdav-sync-ribbon");
 
     this.registerMarkdownPostProcessor((el, ctx) => {
       void this.processSecureImages(el, ctx);
@@ -295,6 +299,11 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return this.lastVaultSyncStatus
       ? this.t(`最近状态：${this.lastVaultSyncStatus}`, `Recent status: ${this.lastVaultSyncStatus}`)
       : this.t("最近状态：暂无", "Recent status: none");
+  }
+
+  async runManualSync() {
+    await this.processPendingTasks();
+    await this.syncConfiguredVaultContent(true);
   }
 
   private async rebuildReferenceIndex() {
