@@ -996,6 +996,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       let restoredFromRemote = 0;
       let deletedRemoteFiles = 0;
       let deletedLocalFiles = 0;
+      let deletedLocalStubs = 0;
 
       let files = this.collectVaultContentFiles();
       let currentPaths = new Set(files.map((file) => file.path));
@@ -1070,7 +1071,11 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           if (stub) {
             const stubRemote = remoteFiles.get(stub.remotePath);
             if (!stubRemote) {
-              missingRemoteBackedNotes += 1;
+              await this.removeLocalVaultFile(file);
+              this.syncIndex.delete(file.path);
+              deletedLocalFiles += 1;
+              deletedLocalStubs += 1;
+              continue;
             }
             this.syncIndex.set(file.path, {
               localSignature,
@@ -1083,8 +1088,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         }
 
         if (!remote) {
-          if (previous && previous.localSignature === localSignature && previous.remoteSignature) {
-            await this.app.vault.trash(file, false);
+          if (previous && this.shouldDeleteLocalWhenRemoteMissing(file, previous)) {
+            await this.removeLocalVaultFile(file);
             this.syncIndex.delete(file.path);
             deletedLocalFiles += 1;
             continue;
@@ -1197,8 +1202,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
-        `已双向同步：上传 ${uploaded} 个文件，从远端拉取 ${restoredFromRemote + downloadedOrUpdated} 个文件，跳过 ${skipped} 个未变化文件，删除远端内容 ${deletedRemoteFiles} 个、本地内容 ${deletedLocalFiles} 个，清理远端空目录 ${deletedRemoteDirectories} 个，清理冗余图片 ${imageCleanup.deletedFiles} 张、目录 ${imageCleanup.deletedDirectories} 个${evictedNotes > 0 ? `，回收本地旧笔记 ${evictedNotes} 篇` : ""}${missingRemoteBackedNotes > 0 ? `，并发现 ${missingRemoteBackedNotes} 篇按需笔记缺少远端正文` : ""}。`,
-        `Bidirectional sync uploaded ${uploaded} file(s), pulled ${restoredFromRemote + downloadedOrUpdated} file(s) from remote, skipped ${skipped} unchanged file(s), deleted ${deletedRemoteFiles} remote content file(s) and ${deletedLocalFiles} local file(s), removed ${deletedRemoteDirectories} remote director${deletedRemoteDirectories === 1 ? "y" : "ies"}, cleaned ${imageCleanup.deletedFiles} orphaned remote image(s) plus ${imageCleanup.deletedDirectories} director${imageCleanup.deletedDirectories === 1 ? "y" : "ies"}${evictedNotes > 0 ? `, and evicted ${evictedNotes} stale local note(s)` : ""}${missingRemoteBackedNotes > 0 ? `, while detecting ${missingRemoteBackedNotes} lazy note(s) missing their remote content` : ""}.`,
+        `已双向同步：上传 ${uploaded} 个文件，从远端拉取 ${restoredFromRemote + downloadedOrUpdated} 个文件，跳过 ${skipped} 个未变化文件，删除远端内容 ${deletedRemoteFiles} 个、本地内容 ${deletedLocalFiles} 个${deletedLocalStubs > 0 ? `（其中失效占位笔记 ${deletedLocalStubs} 篇）` : ""}，清理远端空目录 ${deletedRemoteDirectories} 个，清理冗余图片 ${imageCleanup.deletedFiles} 张、目录 ${imageCleanup.deletedDirectories} 个${evictedNotes > 0 ? `，回收本地旧笔记 ${evictedNotes} 篇` : ""}${missingRemoteBackedNotes > 0 ? `，并发现 ${missingRemoteBackedNotes} 篇按需笔记缺少远端正文` : ""}。`,
+        `Bidirectional sync uploaded ${uploaded} file(s), pulled ${restoredFromRemote + downloadedOrUpdated} file(s) from remote, skipped ${skipped} unchanged file(s), deleted ${deletedRemoteFiles} remote content file(s) and ${deletedLocalFiles} local file(s)${deletedLocalStubs > 0 ? ` (including ${deletedLocalStubs} stale stub note(s))` : ""}, removed ${deletedRemoteDirectories} remote director${deletedRemoteDirectories === 1 ? "y" : "ies"}, cleaned ${imageCleanup.deletedFiles} orphaned remote image(s) plus ${imageCleanup.deletedDirectories} director${imageCleanup.deletedDirectories === 1 ? "y" : "ies"}${evictedNotes > 0 ? `, and evicted ${evictedNotes} stale local note(s)` : ""}${missingRemoteBackedNotes > 0 ? `, while detecting ${missingRemoteBackedNotes} lazy note(s) missing their remote content` : ""}.`,
       );
       await this.savePluginState();
       if (showNotice) {
@@ -1253,9 +1258,58 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return remoteMtime > localMtime + 2000;
   }
 
+  private parseSyncSignature(signature: string) {
+    const [mtimeText, sizeText] = signature.split(":");
+    const mtime = Number.parseInt(mtimeText ?? "", 10);
+    const size = Number.parseInt(sizeText ?? "", 10);
+    if (!Number.isFinite(mtime) || !Number.isFinite(size)) {
+      return null;
+    }
+
+    return { mtime, size };
+  }
+
+  private shouldDeleteLocalWhenRemoteMissing(file: TFile, previous: SyncIndexEntry) {
+    if (!previous.remoteSignature) {
+      return false;
+    }
+
+    const currentSignature = this.buildSyncSignature(file);
+    if (previous.localSignature === currentSignature) {
+      return true;
+    }
+
+    const previousLocal = this.parseSyncSignature(previous.localSignature);
+    const graceMs = 5000;
+    if (previousLocal && file.stat.size === previousLocal.size) {
+      const baseline = Math.max(previousLocal.mtime, this.lastVaultSyncAt || 0);
+      if (file.stat.mtime <= baseline + graceMs) {
+        return true;
+      }
+    }
+
+    if (this.lastVaultSyncAt > 0 && file.stat.mtime <= this.lastVaultSyncAt + graceMs) {
+      return true;
+    }
+
+    return false;
+  }
+
   private getVaultFileByPath(path: string) {
     const file = this.app.vault.getAbstractFileByPath(path);
     return file instanceof TFile ? file : null;
+  }
+
+  private async removeLocalVaultFile(file: TFile) {
+    try {
+      await this.app.vault.delete(file, true);
+    } catch (deleteError) {
+      try {
+        await this.app.vault.trash(file, true);
+      } catch {
+        throw deleteError;
+      }
+    }
   }
 
   private async ensureLocalParentFolders(path: string) {
@@ -1373,7 +1427,17 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     try {
       const remote = await this.statRemoteFile(stub.remotePath);
       if (!remote) {
-        throw new Error(`Remote note not found: ${stub.remotePath}`);
+        await this.removeLocalVaultFile(file);
+        this.syncIndex.delete(file.path);
+        await this.savePluginState();
+        new Notice(
+          this.t(
+            `远端正文不存在，已移除本地占位笔记：${file.basename}`,
+            `Remote note missing, removed local placeholder: ${file.basename}`,
+          ),
+          6000,
+        );
+        return;
       }
 
       await this.downloadRemoteFileToVault(file.path, remote, file);
