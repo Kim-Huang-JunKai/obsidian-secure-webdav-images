@@ -7,6 +7,7 @@ Secure WebDAV Images is an Obsidian plugin that:
 - renders those remote images in notes without public image URLs
 - syncs the rest of the vault to a separate remote notes folder
 - optionally keeps Markdown notes in a lazy on-demand local mode
+- can capture original `http/https` article images into WebDAV so notes no longer depend on the source site
 
 Chinese installation guide: [INSTALL.zh-CN.md](./INSTALL.zh-CN.md)
 

@@ -425,6 +425,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     const seen = new Map<string, UploadRewrite>();
     const wikiMatches = [...content.matchAll(/!\[\[([^\]]+)\]\]/g)];
     const markdownMatches = [...content.matchAll(/!\[[^\]]*]\(([^)]+)\)/g)];
+    const htmlImageMatches = [...content.matchAll(/<img\b[^>]*src=["']([^"']+)["'][^>]*>/gi)];
 
     for (const match of wikiMatches) {
       const rawLink = match[1].split("|")[0].trim();
@@ -445,7 +446,19 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
     for (const match of markdownMatches) {
       const rawLink = decodeURIComponent(match[1].trim().replace(/^<|>$/g, ""));
-      if (/^(https?:|webdav-secure:|data:)/i.test(rawLink)) {
+      if (/^(webdav-secure:|data:)/i.test(rawLink)) {
+        continue;
+      }
+
+      if (this.isHttpUrl(rawLink)) {
+        if (!seen.has(match[0])) {
+          const remoteUrl = await this.uploadRemoteImageUrl(rawLink, uploadCache);
+          const altText = this.extractMarkdownAltText(match[0]) || this.getDisplayNameFromUrl(rawLink);
+          seen.set(match[0], {
+            original: match[0],
+            rewritten: this.buildSecureImageMarkup(remoteUrl, altText),
+          });
+        }
         continue;
       }
 
@@ -464,7 +477,49 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
     }
 
+    for (const match of htmlImageMatches) {
+      const rawLink = this.unescapeHtml(match[1].trim());
+      if (!this.isHttpUrl(rawLink) || seen.has(match[0])) {
+        continue;
+      }
+
+      const remoteUrl = await this.uploadRemoteImageUrl(rawLink, uploadCache);
+      const altText = this.extractHtmlImageAltText(match[0]) || this.getDisplayNameFromUrl(rawLink);
+      seen.set(match[0], {
+        original: match[0],
+        rewritten: this.buildSecureImageMarkup(remoteUrl, altText),
+      });
+    }
+
     return [...seen.values()];
+  }
+
+  private extractMarkdownAltText(markdownImage: string) {
+    const match = markdownImage.match(/^!\[([^\]]*)\]/);
+    return match?.[1]?.trim() ?? "";
+  }
+
+  private extractHtmlImageAltText(htmlImage: string) {
+    const match = htmlImage.match(/\balt=["']([^"']*)["']/i);
+    return match ? this.unescapeHtml(match[1].trim()) : "";
+  }
+
+  private isHttpUrl(value: string) {
+    return /^https?:\/\//i.test(value);
+  }
+
+  private getDisplayNameFromUrl(rawUrl: string) {
+    try {
+      const url = new URL(rawUrl);
+      const fileName = this.sanitizeFileName(url.pathname.split("/").pop() || "");
+      if (fileName) {
+        return fileName.replace(/\.[^.]+$/, "");
+      }
+    } catch {
+      // Fall through to the generic label below.
+    }
+
+    return this.t("网页图片", "Web image");
   }
 
   private resolveLinkedFile(link: string, sourcePath: string): TFile | null {
@@ -493,6 +548,104 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return remoteUrl;
   }
 
+  private async uploadRemoteImageUrl(imageUrl: string, uploadCache?: Map<string, string>) {
+    const cacheKey = `remote:${imageUrl}`;
+    if (uploadCache?.has(cacheKey)) {
+      return uploadCache.get(cacheKey)!;
+    }
+
+    this.ensureConfigured();
+    const response = await this.requestUrl({
+      url: imageUrl,
+      method: "GET",
+      followRedirects: true,
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`Remote image download failed with status ${response.status}`);
+    }
+
+    const contentType = response.headers["content-type"] ?? "";
+    if (!this.isImageContentType(contentType) && !this.looksLikeImageUrl(imageUrl)) {
+      throw new Error(this.t("远程链接不是可识别的图片资源。", "The remote URL does not look like an image resource."));
+    }
+
+    const fileName = this.buildRemoteSourceFileName(imageUrl, contentType);
+    const prepared = await this.prepareUploadPayload(
+      response.arrayBuffer,
+      this.normalizeImageMimeType(contentType, fileName),
+      fileName,
+    );
+    const remoteName = this.buildRemoteFileNameFromBinary(prepared.fileName, prepared.binary);
+    const remotePath = this.buildRemotePath(remoteName);
+    await this.uploadBinary(remotePath, prepared.binary, prepared.mimeType);
+    const remoteUrl = `${SECURE_PROTOCOL}//${remotePath}`;
+    uploadCache?.set(cacheKey, remoteUrl);
+    return remoteUrl;
+  }
+
+  private isImageContentType(contentType: string) {
+    return /^image\//i.test(contentType.trim());
+  }
+
+  private looksLikeImageUrl(rawUrl: string) {
+    try {
+      const url = new URL(rawUrl);
+      return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(url.pathname);
+    } catch {
+      return false;
+    }
+  }
+
+  private buildRemoteSourceFileName(rawUrl: string, contentType: string) {
+    try {
+      const url = new URL(rawUrl);
+      const candidate = this.sanitizeFileName(url.pathname.split("/").pop() || "");
+      if (candidate && /\.[a-z0-9]+$/i.test(candidate)) {
+        return candidate;
+      }
+
+      const extension = this.getExtensionFromMimeType(contentType) || "png";
+      return candidate ? `${candidate}.${extension}` : `remote-image.${extension}`;
+    } catch {
+      const extension = this.getExtensionFromMimeType(contentType) || "png";
+      return `remote-image.${extension}`;
+    }
+  }
+
+  private sanitizeFileName(fileName: string) {
+    return fileName.replace(/[\\/:*?"<>|]+/g, "-").trim();
+  }
+
+  private getExtensionFromMimeType(contentType: string) {
+    const mimeType = contentType.split(";")[0].trim().toLowerCase();
+    switch (mimeType) {
+      case "image/jpeg":
+        return "jpg";
+      case "image/png":
+        return "png";
+      case "image/gif":
+        return "gif";
+      case "image/webp":
+        return "webp";
+      case "image/bmp":
+        return "bmp";
+      case "image/svg+xml":
+        return "svg";
+      default:
+        return "";
+    }
+  }
+
+  private normalizeImageMimeType(contentType: string, fileName: string) {
+    const mimeType = contentType.split(";")[0].trim().toLowerCase();
+    if (mimeType && mimeType !== "application/octet-stream") {
+      return mimeType;
+    }
+
+    return this.getMimeTypeFromFileName(fileName);
+  }
+
   private async uploadBinary(remotePath: string, binary: ArrayBuffer, mimeType: string) {
     await this.ensureRemoteDirectories(remotePath);
     const response = await this.requestUrl({
@@ -516,13 +669,20 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     const imageFile = this.extractImageFileFromClipboard(evt);
-    if (!imageFile) {
+    if (imageFile) {
+      evt.preventDefault();
+      const fileName = imageFile.name || this.buildClipboardFileName(imageFile.type);
+      await this.enqueueEditorImageUpload(info.file, editor, imageFile, fileName);
+      return;
+    }
+
+    const html = evt.clipboardData?.getData("text/html")?.trim() ?? "";
+    if (!html || !this.htmlContainsRemoteImages(html)) {
       return;
     }
 
     evt.preventDefault();
-    const fileName = imageFile.name || this.buildClipboardFileName(imageFile.type);
-    await this.enqueueEditorImageUpload(info.file, editor, imageFile, fileName);
+    await this.handleHtmlPasteWithRemoteImages(info.file, editor, html);
   }
 
   private async handleEditorDrop(evt: DragEvent, editor: Editor, info: MarkdownView | MarkdownFileInfo) {
@@ -548,6 +708,178 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
     const item = Array.from(evt.clipboardData?.items ?? []).find((entry) => entry.type.startsWith("image/"));
     return item?.getAsFile() ?? null;
+  }
+
+  private htmlContainsRemoteImages(html: string) {
+    return /<img\b[^>]*src=["']https?:\/\/[^"']+["'][^>]*>/i.test(html);
+  }
+
+  private async handleHtmlPasteWithRemoteImages(noteFile: TFile, editor: Editor, html: string) {
+    try {
+      const rendered = await this.convertHtmlClipboardToSecureMarkdown(html, noteFile);
+      if (!rendered.trim()) {
+        return;
+      }
+
+      editor.replaceSelection(rendered);
+      new Notice(this.t("已将网页图文粘贴并抓取远程图片。", "Pasted web content and captured remote images."));
+    } catch (error) {
+      console.error("Failed to paste HTML content with remote images", error);
+      new Notice(
+        this.describeError(
+          this.t("处理网页图文粘贴失败", "Failed to process pasted web content"),
+          error,
+        ),
+        8000,
+      );
+    }
+  }
+
+  private async convertHtmlClipboardToSecureMarkdown(html: string, noteFile: TFile) {
+    const parser = new DOMParser();
+    const document = parser.parseFromString(html, "text/html");
+    const uploadCache = new Map<string, string>();
+    const renderedBlocks: string[] = [];
+
+    for (const node of Array.from(document.body.childNodes)) {
+      const block = await this.renderPastedHtmlNode(node, noteFile, uploadCache, 0);
+      if (block.trim()) {
+        renderedBlocks.push(block.trim());
+      }
+    }
+
+    return renderedBlocks.join("\n\n") + "\n";
+  }
+
+  private async renderPastedHtmlNode(
+    node: Node,
+    noteFile: TFile,
+    uploadCache: Map<string, string>,
+    listDepth: number,
+  ): Promise<string> {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return this.normalizeClipboardText(node.textContent ?? "");
+    }
+
+    if (!(node instanceof HTMLElement)) {
+      return "";
+    }
+
+    const tag = node.tagName.toLowerCase();
+    if (tag === "img") {
+      const src = this.unescapeHtml(node.getAttribute("src")?.trim() ?? "");
+      if (!this.isHttpUrl(src)) {
+        return "";
+      }
+
+      const alt = (node.getAttribute("alt") ?? "").trim() || this.getDisplayNameFromUrl(src);
+      const remoteUrl = await this.uploadRemoteImageUrl(src, uploadCache);
+      return this.buildSecureImageMarkup(remoteUrl, alt);
+    }
+
+    if (tag === "br") {
+      return "\n";
+    }
+
+    if (tag === "ul" || tag === "ol") {
+      const items: string[] = [];
+      let index = 1;
+      for (const child of Array.from(node.children)) {
+        if (child.tagName.toLowerCase() !== "li") {
+          continue;
+        }
+
+        const rendered = (await this.renderPastedHtmlNode(child, noteFile, uploadCache, listDepth + 1)).trim();
+        if (!rendered) {
+          continue;
+        }
+
+        const prefix = tag === "ol" ? `${index}. ` : "- ";
+        items.push(`${"  ".repeat(Math.max(0, listDepth))}${prefix}${rendered}`);
+        index += 1;
+      }
+
+      return items.join("\n");
+    }
+
+    if (tag === "li") {
+      const parts = await this.renderPastedHtmlChildren(node, noteFile, uploadCache, listDepth);
+      return parts.join("").trim();
+    }
+
+    if (/^h[1-6]$/.test(tag)) {
+      const level = Number.parseInt(tag[1], 10);
+      const text = (await this.renderPastedHtmlChildren(node, noteFile, uploadCache, listDepth)).join("").trim();
+      return text ? `${"#".repeat(level)} ${text}` : "";
+    }
+
+    if (tag === "a") {
+      const href = node.getAttribute("href")?.trim() ?? "";
+      const text = (await this.renderPastedHtmlChildren(node, noteFile, uploadCache, listDepth)).join("").trim();
+      if (href && /^https?:\/\//i.test(href) && text) {
+        return `[${text}](${href})`;
+      }
+      return text;
+    }
+
+    const inlineTags = new Set(["strong", "b", "em", "i", "span", "code", "small", "sup", "sub"]);
+    if (inlineTags.has(tag)) {
+      return (await this.renderPastedHtmlChildren(node, noteFile, uploadCache, listDepth)).join("");
+    }
+
+    const blockTags = new Set([
+      "p",
+      "div",
+      "article",
+      "section",
+      "figure",
+      "figcaption",
+      "blockquote",
+      "pre",
+      "table",
+      "thead",
+      "tbody",
+      "tr",
+      "td",
+      "th",
+    ]);
+    if (blockTags.has(tag)) {
+      const text = (await this.renderPastedHtmlChildren(node, noteFile, uploadCache, listDepth)).join("").trim();
+      return text;
+    }
+
+    return (await this.renderPastedHtmlChildren(node, noteFile, uploadCache, listDepth)).join("");
+  }
+
+  private async renderPastedHtmlChildren(
+    element: HTMLElement,
+    noteFile: TFile,
+    uploadCache: Map<string, string>,
+    listDepth: number,
+  ) {
+    const parts: string[] = [];
+    for (const child of Array.from(element.childNodes)) {
+      const rendered = await this.renderPastedHtmlNode(child, noteFile, uploadCache, listDepth);
+      if (!rendered) {
+        continue;
+      }
+
+      if (parts.length > 0 && !rendered.startsWith("\n") && !parts[parts.length - 1].endsWith("\n")) {
+        const previous = parts[parts.length - 1];
+        const needsSpace = /\S$/.test(previous) && /^\S/.test(rendered);
+        if (needsSpace) {
+          parts.push(" ");
+        }
+      }
+
+      parts.push(rendered);
+    }
+
+    return parts;
+  }
+
+  private normalizeClipboardText(value: string) {
+    return value.replace(/\s+/g, " ");
   }
 
   private extractImageFileFromDrop(evt: DragEvent) {
@@ -1159,7 +1491,9 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       if (this.settings.deleteLocalAfterUpload) {
         for (const replacement of replacements) {
-          await this.trashIfExists(replacement.sourceFile);
+          if (replacement.sourceFile) {
+            await this.trashIfExists(replacement.sourceFile);
+          }
         }
       }
 
@@ -1659,7 +1993,9 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         const content = await this.app.vault.read(file);
         const replacements = await this.buildUploadReplacements(content, file, uploadCache);
         for (const replacement of replacements) {
-          candidateLocalImages.set(replacement.sourceFile.path, replacement.sourceFile);
+          if (replacement.sourceFile) {
+            candidateLocalImages.set(replacement.sourceFile.path, replacement.sourceFile);
+          }
         }
 
         let updated = content;
@@ -1847,6 +2183,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     method: string;
     headers?: Record<string, string>;
     body?: ArrayBuffer;
+    followRedirects?: boolean;
+    redirectCount?: number;
   }): Promise<{ status: number; headers: Record<string, string>; arrayBuffer: ArrayBuffer }> {
     const target = new URL(options.url);
     const transport = target.protocol === "https:" ? httpsRequest : httpRequest;
@@ -1867,8 +2205,31 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           res.on("data", (chunk) => {
             chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
           });
-          res.on("end", () => {
+          res.on("end", async () => {
             const merged = chunks.length > 0 ? Buffer.concat(chunks) : Buffer.alloc(0);
+            const location = res.headers.location;
+            const shouldRedirect =
+              options.followRedirects &&
+              !!location &&
+              [301, 302, 303, 307, 308].includes(res.statusCode ?? 0) &&
+              (options.redirectCount ?? 0) < 5;
+
+            if (shouldRedirect) {
+              try {
+                const redirected = await this.requestUrl({
+                  url: new URL(Array.isArray(location) ? location[0] : location, target).toString(),
+                  method: "GET",
+                  headers: options.headers,
+                  followRedirects: true,
+                  redirectCount: (options.redirectCount ?? 0) + 1,
+                });
+                resolve(redirected);
+              } catch (error) {
+                reject(error);
+              }
+              return;
+            }
+
             resolve({
               status: res.statusCode ?? 0,
               headers: Object.fromEntries(
@@ -1901,7 +2262,7 @@ class SecureWebdavRenderChild extends MarkdownRenderChild {
 type UploadRewrite = {
   original: string;
   rewritten: string;
-  sourceFile: TFile;
+  sourceFile?: TFile;
 };
 
 class SecureWebdavSettingTab extends PluginSettingTab {
