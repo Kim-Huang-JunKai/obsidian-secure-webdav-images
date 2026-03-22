@@ -25,24 +25,107 @@
 
 目前最适合通过“手动安装社区插件”的方式使用。
 
+推荐优先下载 Release 里的安装压缩包：
+
+```text
+secure-webdav-images-0.0.1.zip
+```
+
+这个压缩包里已经包含安装所需的核心文件：
+
+- `main.js`
+- `manifest.json`
+- `styles.css`
+- `INSTALL.zh-CN.md`
+
 ### 方法一：从发布包手动安装
 
 1. 打开插件仓库的 Release 页面。
-2. 下载当前版本里的这 3 个文件：
-   - `main.js`
-   - `manifest.json`
-   - `styles.css`
-3. 打开你的 Obsidian vault 目录。
-4. 进入：
+2. 下载当前版本里的安装压缩包：
+
+```text
+secure-webdav-images-0.0.1.zip
+```
+
+3. 解压压缩包。
+4. 打开你的 Obsidian vault 目录。
+5. 进入：
 
 ```text
 .obsidian/plugins/secure-webdav-images/
 ```
 
-5. 如果目录不存在，就手动创建。
-6. 把刚才下载的 3 个文件放进去。
-7. 重新启动 Obsidian，或重新加载社区插件。
-8. 在 `设置 > 社区插件` 中启用 `Secure WebDAV Images`。
+6. 如果目录不存在，就手动创建。
+7. 把解压后目录中的这 3 个文件放进去：
+   - `main.js`
+   - `manifest.json`
+   - `styles.css`
+8. 重新启动 Obsidian，或重新加载社区插件。
+9. 在 `设置 > 社区插件` 中启用 `Secure WebDAV Images`。
+
+## 手机端安装
+
+手机端安装的关键目标是“尽量少折腾文件”。
+
+最推荐的方式也是下载安装压缩包，然后只把里面的 3 个核心文件放到插件目录。
+
+### Android 安装步骤
+
+1. 在手机浏览器中打开插件仓库的 Release 页面。
+2. 下载：
+
+```text
+secure-webdav-images-0.0.1.zip
+```
+
+3. 用手机文件管理器解压压缩包。
+4. 找到你的 Obsidian vault 目录。
+5. 进入：
+
+```text
+<你的 Vault>/.obsidian/plugins/secure-webdav-images/
+```
+
+6. 如果目录不存在，就手动创建。
+7. 把压缩包中的这 3 个文件复制进去：
+   - `main.js`
+   - `manifest.json`
+   - `styles.css`
+8. 打开 Obsidian。
+9. 进入 `设置 > 社区插件`。
+10. 关闭受限模式并启用插件。
+
+### iPhone / iPad 安装思路
+
+iOS 上手动安装插件会比桌面和 Android 更麻烦，因为文件管理和 App 沙盒限制更严格。
+
+最稳的方式是：
+
+1. 先在电脑上把插件安装到同一个 vault。
+2. 确认插件目录已经存在：
+
+```text
+.obsidian/plugins/secure-webdav-images/
+```
+
+3. 再通过你的 vault 同步方式，把这个插件目录一起带到移动端。
+4. 在移动端 Obsidian 中启用插件。
+
+如果你必须在 iPhone / iPad 上纯手动安装，原则仍然一样：
+
+- 下载安装压缩包
+- 解压
+- 把 `main.js`、`manifest.json`、`styles.css` 放进插件目录
+
+但具体可操作性会取决于你使用的文件管理方式和 vault 存储位置。
+
+### 手机端最简建议
+
+如果你希望用户尽量少操作，可以直接让用户记住这一句话：
+
+```text
+下载 secure-webdav-images-0.0.1.zip，解压后把 main.js、manifest.json、styles.css 放进 .obsidian/plugins/secure-webdav-images/
+```
 
 ### 方法二：开发环境本地安装
 
