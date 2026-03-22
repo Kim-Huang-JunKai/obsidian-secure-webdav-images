@@ -1,0 +1,33 @@
+.secure-webdav-image.is-loading,
+.secure-webdav-image.is-error,
+.secure-webdav-pending,
+.secure-webdav-failed {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 96px;
+  min-width: 160px;
+  border: 1px dashed var(--background-modifier-border);
+  border-radius: 12px;
+  color: var(--text-muted);
+  background: var(--background-secondary);
+  padding: 12px;
+}
+
+.secure-webdav-pending {
+  color: var(--text-accent);
+}
+
+.secure-webdav-failed {
+  color: var(--text-error);
+  border: 1px solid var(--text-error);
+}
+
+.secure-webdav-editor-widget {
+  margin: 6px 0;
+}
+
+.secure-webdav-editor-preview {
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+}
