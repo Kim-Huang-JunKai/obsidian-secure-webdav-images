@@ -50,12 +50,20 @@ type UploadTask = {
 };
 
 type SyncIndexEntry = {
-  signature: string;
+  localSignature: string;
+  remoteSignature: string;
   remotePath: string;
 };
 
+type RemoteFileState = {
+  remotePath: string;
+  lastModified: number;
+  size: number;
+  signature: string;
+};
+
 type RemoteInventory = {
-  files: Set<string>;
+  files: Map<string, RemoteFileState>;
   directories: Set<string>;
 };
 
@@ -215,9 +223,13 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       this.noteAccessTimestamps = new Map(
         Object.entries((candidate.noteAccessTimestamps as Record<string, number> | undefined) ?? {}),
       );
-      this.syncIndex = new Map(
-        Object.entries((candidate.syncIndex as Record<string, SyncIndexEntry> | undefined) ?? {}),
-      );
+      this.syncIndex = new Map();
+      for (const [path, rawEntry] of Object.entries((candidate.syncIndex as Record<string, unknown> | undefined) ?? {})) {
+        const normalized = this.normalizeSyncIndexEntry(path, rawEntry);
+        if (normalized) {
+          this.syncIndex.set(path, normalized);
+        }
+      }
       this.lastVaultSyncAt =
         typeof candidate.lastVaultSyncAt === "number" ? candidate.lastVaultSyncAt : 0;
       this.lastVaultSyncStatus =
@@ -269,6 +281,36 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
   async saveSettings() {
     await this.savePluginState();
+  }
+
+  private normalizeSyncIndexEntry(vaultPath: string, rawEntry: unknown): SyncIndexEntry | null {
+    if (!rawEntry || typeof rawEntry !== "object") {
+      return null;
+    }
+
+    const candidate = rawEntry as Record<string, unknown>;
+    const remotePath =
+      typeof candidate.remotePath === "string" && candidate.remotePath.length > 0
+        ? candidate.remotePath
+        : this.buildVaultSyncRemotePath(vaultPath);
+    const localSignature =
+      typeof candidate.localSignature === "string"
+        ? candidate.localSignature
+        : typeof candidate.signature === "string"
+          ? candidate.signature
+          : "";
+    const remoteSignature =
+      typeof candidate.remoteSignature === "string"
+        ? candidate.remoteSignature
+        : typeof candidate.signature === "string"
+          ? candidate.signature
+          : "";
+
+    return {
+      localSignature,
+      remoteSignature,
+      remotePath,
+    };
   }
 
   t(zh: string, en: string) {
@@ -947,42 +989,92 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.syncInProgress = true;
     try {
       this.ensureConfigured();
-      const files = this.collectVaultContentFiles();
       await this.rebuildReferenceIndex();
 
       const remoteInventory = await this.listRemoteTree(this.settings.vaultSyncRemoteFolder);
       const remoteFiles = remoteInventory.files;
-      const currentPaths = new Set(files.map((file) => file.path));
+      let restoredFromRemote = 0;
+      let deletedRemoteFiles = 0;
+      let deletedLocalFiles = 0;
+
+      let files = this.collectVaultContentFiles();
+      let currentPaths = new Set(files.map((file) => file.path));
       for (const path of [...this.syncIndex.keys()]) {
         if (!currentPaths.has(path)) {
-          const removed = this.syncIndex.get(path);
-          if (removed) {
-            if (remoteFiles.has(removed.remotePath)) {
-              await this.deleteRemoteContentFile(removed.remotePath);
-              remoteFiles.delete(removed.remotePath);
-            }
+          const previous = this.syncIndex.get(path);
+          if (!previous) {
+            this.syncIndex.delete(path);
+            continue;
           }
+
+          const remote = remoteFiles.get(previous.remotePath);
+          if (!remote) {
+            this.syncIndex.delete(path);
+            continue;
+          }
+
+          if (previous.remoteSignature && previous.remoteSignature !== remote.signature) {
+            await this.downloadRemoteFileToVault(path, remote);
+            this.syncIndex.set(path, {
+              localSignature: remote.signature,
+              remoteSignature: remote.signature,
+              remotePath: remote.remotePath,
+            });
+            restoredFromRemote += 1;
+            continue;
+          }
+
+          await this.deleteRemoteContentFile(remote.remotePath);
+          remoteFiles.delete(remote.remotePath);
           this.syncIndex.delete(path);
+          deletedRemoteFiles += 1;
         }
       }
 
       let uploaded = 0;
       let skipped = 0;
       let missingRemoteBackedNotes = 0;
+
+      files = this.collectVaultContentFiles();
+      currentPaths = new Set(files.map((file) => file.path));
+      for (const remote of [...remoteFiles.values()].sort((a, b) => a.remotePath.localeCompare(b.remotePath))) {
+        const vaultPath = this.remotePathToVaultPath(remote.remotePath);
+        if (!vaultPath || currentPaths.has(vaultPath)) {
+          continue;
+        }
+
+        await this.downloadRemoteFileToVault(vaultPath, remote);
+        this.syncIndex.set(vaultPath, {
+          localSignature: remote.signature,
+          remoteSignature: remote.signature,
+          remotePath: remote.remotePath,
+        });
+        restoredFromRemote += 1;
+      }
+
+      files = this.collectVaultContentFiles();
+      currentPaths = new Set(files.map((file) => file.path));
       const localRemotePaths = new Set<string>();
+      let downloadedOrUpdated = 0;
       for (const file of files) {
         const remotePath = this.buildVaultSyncRemotePath(file.path);
         localRemotePaths.add(remotePath);
+        const remote = remoteFiles.get(remotePath);
+        const remoteSignature = remote?.signature ?? "";
+        const localSignature = this.buildSyncSignature(file);
+        const previous = this.syncIndex.get(file.path);
 
         if (file.extension === "md") {
           const content = await this.app.vault.read(file);
           const stub = this.parseNoteStub(content);
           if (stub) {
-            if (!remoteFiles.has(stub.remotePath)) {
+            const stubRemote = remoteFiles.get(stub.remotePath);
+            if (!stubRemote) {
               missingRemoteBackedNotes += 1;
             }
             this.syncIndex.set(file.path, {
-              signature: this.buildSyncSignature(file),
+              localSignature,
+              remoteSignature: stubRemote?.signature ?? previous?.remoteSignature ?? "",
               remotePath,
             });
             skipped += 1;
@@ -990,30 +1082,110 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           }
         }
 
-        const signature = this.buildSyncSignature(file);
-        const previous = this.syncIndex.get(file.path);
-        const existsRemotely = remoteFiles.has(remotePath);
-        if (previous && previous.signature === signature && previous.remotePath === remotePath && existsRemotely) {
+        if (!remote) {
+          if (previous && previous.localSignature === localSignature && previous.remoteSignature) {
+            await this.app.vault.trash(file, false);
+            this.syncIndex.delete(file.path);
+            deletedLocalFiles += 1;
+            continue;
+          }
+
+          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+          this.syncIndex.set(file.path, {
+            localSignature,
+            remoteSignature: uploadedRemote.signature,
+            remotePath,
+          });
+          remoteFiles.set(remotePath, uploadedRemote);
+          uploaded += 1;
+          continue;
+        }
+
+        if (!previous) {
+          if (localSignature === remoteSignature) {
+            this.syncIndex.set(file.path, {
+              localSignature,
+              remoteSignature,
+              remotePath,
+            });
+            skipped += 1;
+            continue;
+          }
+
+          if (this.shouldDownloadRemoteVersion(file.stat.mtime, remote.lastModified)) {
+            await this.downloadRemoteFileToVault(file.path, remote, file);
+            const refreshed = this.getVaultFileByPath(file.path);
+            this.syncIndex.set(file.path, {
+              localSignature: refreshed ? this.buildSyncSignature(refreshed) : remoteSignature,
+              remoteSignature,
+              remotePath,
+            });
+            downloadedOrUpdated += 1;
+            continue;
+          }
+
+          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+          this.syncIndex.set(file.path, {
+            localSignature,
+            remoteSignature: uploadedRemote.signature,
+            remotePath,
+          });
+          remoteFiles.set(remotePath, uploadedRemote);
+          uploaded += 1;
+          continue;
+        }
+
+        const localChanged = previous.localSignature !== localSignature || previous.remotePath !== remotePath;
+        const remoteChanged = previous.remoteSignature !== remoteSignature || previous.remotePath !== remotePath;
+        if (!localChanged && !remoteChanged) {
           skipped += 1;
           continue;
         }
 
-        const binary = await this.app.vault.readBinary(file);
-        await this.uploadBinary(remotePath, binary, this.getMimeType(file.extension));
-        this.syncIndex.set(file.path, { signature, remotePath });
-        remoteFiles.add(remotePath);
-        uploaded += 1;
-      }
-
-      let deletedRemoteFiles = 0;
-      for (const remotePath of [...remoteFiles].sort((a, b) => b.localeCompare(a))) {
-        if (localRemotePaths.has(remotePath)) {
+        if (!localChanged && remoteChanged) {
+          await this.downloadRemoteFileToVault(file.path, remote, file);
+          const refreshed = this.getVaultFileByPath(file.path);
+          this.syncIndex.set(file.path, {
+            localSignature: refreshed ? this.buildSyncSignature(refreshed) : remoteSignature,
+            remoteSignature,
+            remotePath,
+          });
+          downloadedOrUpdated += 1;
           continue;
         }
 
-        await this.deleteRemoteContentFile(remotePath);
-        remoteFiles.delete(remotePath);
-        deletedRemoteFiles += 1;
+        if (localChanged && !remoteChanged) {
+          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+          this.syncIndex.set(file.path, {
+            localSignature,
+            remoteSignature: uploadedRemote.signature,
+            remotePath,
+          });
+          remoteFiles.set(remotePath, uploadedRemote);
+          uploaded += 1;
+          continue;
+        }
+
+        if (this.shouldDownloadRemoteVersion(file.stat.mtime, remote.lastModified)) {
+          await this.downloadRemoteFileToVault(file.path, remote, file);
+          const refreshed = this.getVaultFileByPath(file.path);
+          this.syncIndex.set(file.path, {
+            localSignature: refreshed ? this.buildSyncSignature(refreshed) : remoteSignature,
+            remoteSignature,
+            remotePath,
+          });
+          downloadedOrUpdated += 1;
+          continue;
+        }
+
+        const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+        this.syncIndex.set(file.path, {
+          localSignature,
+          remoteSignature: uploadedRemote.signature,
+          remotePath,
+        });
+        remoteFiles.set(remotePath, uploadedRemote);
+        uploaded += 1;
       }
 
       const deletedRemoteDirectories = await this.deleteExtraRemoteDirectories(
@@ -1025,8 +1197,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
-        `已对账同步 ${uploaded} 个文件，跳过 ${skipped} 个未变化文件，删除远端多余内容 ${deletedRemoteFiles} 个、目录 ${deletedRemoteDirectories} 个，清理冗余图片 ${imageCleanup.deletedFiles} 张、目录 ${imageCleanup.deletedDirectories} 个${evictedNotes > 0 ? `，回收本地旧笔记 ${evictedNotes} 篇` : ""}${missingRemoteBackedNotes > 0 ? `，并发现 ${missingRemoteBackedNotes} 篇按需笔记缺少远端正文` : ""}。`,
-        `Reconciled sync uploaded ${uploaded} file(s), skipped ${skipped} unchanged file(s), deleted ${deletedRemoteFiles} extra remote content file(s), removed ${deletedRemoteDirectories} remote director${deletedRemoteDirectories === 1 ? "y" : "ies"}, cleaned ${imageCleanup.deletedFiles} orphaned remote image(s) plus ${imageCleanup.deletedDirectories} director${imageCleanup.deletedDirectories === 1 ? "y" : "ies"}${evictedNotes > 0 ? `, and evicted ${evictedNotes} stale local note(s)` : ""}${missingRemoteBackedNotes > 0 ? `, while detecting ${missingRemoteBackedNotes} lazy note(s) missing their remote content` : ""}.`,
+        `已双向同步：上传 ${uploaded} 个文件，从远端拉取 ${restoredFromRemote + downloadedOrUpdated} 个文件，跳过 ${skipped} 个未变化文件，删除远端内容 ${deletedRemoteFiles} 个、本地内容 ${deletedLocalFiles} 个，清理远端空目录 ${deletedRemoteDirectories} 个，清理冗余图片 ${imageCleanup.deletedFiles} 张、目录 ${imageCleanup.deletedDirectories} 个${evictedNotes > 0 ? `，回收本地旧笔记 ${evictedNotes} 篇` : ""}${missingRemoteBackedNotes > 0 ? `，并发现 ${missingRemoteBackedNotes} 篇按需笔记缺少远端正文` : ""}。`,
+        `Bidirectional sync uploaded ${uploaded} file(s), pulled ${restoredFromRemote + downloadedOrUpdated} file(s) from remote, skipped ${skipped} unchanged file(s), deleted ${deletedRemoteFiles} remote content file(s) and ${deletedLocalFiles} local file(s), removed ${deletedRemoteDirectories} remote director${deletedRemoteDirectories === 1 ? "y" : "ies"}, cleaned ${imageCleanup.deletedFiles} orphaned remote image(s) plus ${imageCleanup.deletedDirectories} director${imageCleanup.deletedDirectories === 1 ? "y" : "ies"}${evictedNotes > 0 ? `, and evicted ${evictedNotes} stale local note(s)` : ""}${missingRemoteBackedNotes > 0 ? `, while detecting ${missingRemoteBackedNotes} lazy note(s) missing their remote content` : ""}.`,
       );
       await this.savePluginState();
       if (showNotice) {
@@ -1064,6 +1236,118 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
   }
 
+  private buildRemoteSyncSignature(remote: Pick<RemoteFileState, "lastModified" | "size">) {
+    return `${remote.lastModified}:${remote.size}`;
+  }
+
+  private remotePathToVaultPath(remotePath: string) {
+    const root = this.normalizeFolder(this.settings.vaultSyncRemoteFolder);
+    if (!remotePath.startsWith(root)) {
+      return null;
+    }
+
+    return remotePath.slice(root.length).replace(/^\/+/, "");
+  }
+
+  private shouldDownloadRemoteVersion(localMtime: number, remoteMtime: number) {
+    return remoteMtime > localMtime + 2000;
+  }
+
+  private getVaultFileByPath(path: string) {
+    const file = this.app.vault.getAbstractFileByPath(path);
+    return file instanceof TFile ? file : null;
+  }
+
+  private async ensureLocalParentFolders(path: string) {
+    const normalized = normalizePath(path);
+    const segments = normalized.split("/").filter((value) => value.length > 0);
+    if (segments.length <= 1) {
+      return;
+    }
+
+    let current = "";
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      current = current ? `${current}/${segments[index]}` : segments[index];
+      const existing = this.app.vault.getAbstractFileByPath(current);
+      if (!existing) {
+        await this.app.vault.createFolder(current);
+      }
+    }
+  }
+
+  private async downloadRemoteFileToVault(vaultPath: string, remote: RemoteFileState, existingFile?: TFile) {
+    const response = await this.requestUrl({
+      url: this.buildUploadUrl(remote.remotePath),
+      method: "GET",
+      headers: {
+        Authorization: this.buildAuthHeader(),
+      },
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`GET failed with status ${response.status}`);
+    }
+
+    await this.ensureLocalParentFolders(vaultPath);
+    const current = existingFile ?? this.getVaultFileByPath(vaultPath);
+    const options = {
+      mtime: remote.lastModified > 0 ? remote.lastModified : Date.now(),
+    };
+    if (!current) {
+      if (vaultPath.toLowerCase().endsWith(".md")) {
+        await this.app.vault.create(vaultPath, this.decodeUtf8(response.arrayBuffer), options);
+      } else {
+        await this.app.vault.createBinary(vaultPath, response.arrayBuffer, options);
+      }
+      return;
+    }
+
+    if (current.extension === "md") {
+      await this.app.vault.modify(current, this.decodeUtf8(response.arrayBuffer), options);
+    } else {
+      await this.app.vault.modifyBinary(current, response.arrayBuffer, options);
+    }
+  }
+
+  private async statRemoteFile(remotePath: string) {
+    const response = await this.requestUrl({
+      url: this.buildUploadUrl(remotePath),
+      method: "PROPFIND",
+      headers: {
+        Authorization: this.buildAuthHeader(),
+        Depth: "0",
+      },
+    });
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`PROPFIND failed for ${remotePath} with status ${response.status}`);
+    }
+
+    const xmlText = this.decodeUtf8(response.arrayBuffer);
+    const entries = this.parsePropfindDirectoryListing(xmlText, remotePath, true);
+    return entries.find((entry) => !entry.isCollection)?.file ?? null;
+  }
+
+  private async uploadContentFileToRemote(file: TFile, remotePath: string) {
+    const binary = await this.app.vault.readBinary(file);
+    await this.uploadBinary(remotePath, binary, this.getMimeType(file.extension));
+    const remote = await this.statRemoteFile(remotePath);
+    if (remote) {
+      return remote;
+    }
+
+    return {
+      remotePath,
+      lastModified: file.stat.mtime,
+      size: file.stat.size,
+      signature: this.buildSyncSignature(file),
+    };
+  }
+
   private async deleteRemoteSyncedEntry(vaultPath: string) {
     const existing = this.syncIndex.get(vaultPath);
     const remotePath = existing?.remotePath ?? this.buildVaultSyncRemotePath(vaultPath);
@@ -1087,20 +1371,19 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     try {
-      const response = await this.requestUrl({
-        url: this.buildUploadUrl(stub.remotePath),
-        method: "GET",
-        headers: {
-          Authorization: this.buildAuthHeader(),
-        },
-      });
-
-      if (response.status < 200 || response.status >= 300) {
-        throw new Error(`GET failed with status ${response.status}`);
+      const remote = await this.statRemoteFile(stub.remotePath);
+      if (!remote) {
+        throw new Error(`Remote note not found: ${stub.remotePath}`);
       }
 
-      const hydrated = this.decodeUtf8(response.arrayBuffer);
-      await this.app.vault.modify(file, hydrated);
+      await this.downloadRemoteFileToVault(file.path, remote, file);
+      const refreshed = this.getVaultFileByPath(file.path);
+      this.syncIndex.set(file.path, {
+        localSignature: refreshed ? this.buildSyncSignature(refreshed) : remote.signature,
+        remoteSignature: remote.signature,
+        remotePath: stub.remotePath,
+      });
+      await this.savePluginState();
       new Notice(this.t(`已从远端恢复笔记：${file.basename}`, `Restored note from remote: ${file.basename}`), 6000);
     } catch (error) {
       console.error("Failed to hydrate note from remote", error);
@@ -1153,7 +1436,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     let deletedFiles = 0;
-    for (const remotePath of [...remoteInventory.files].sort((a, b) => b.localeCompare(a))) {
+    for (const remotePath of [...remoteInventory.files.keys()].sort((a, b) => b.localeCompare(a))) {
       if (expectedFiles.has(remotePath)) {
         continue;
       }
@@ -1232,7 +1515,14 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         const binary = await this.app.vault.readBinary(file);
         const remotePath = this.buildVaultSyncRemotePath(file.path);
         await this.uploadBinary(remotePath, binary, "text/markdown; charset=utf-8");
+        const remote = await this.statRemoteFile(remotePath);
         await this.app.vault.modify(file, this.buildNoteStub(file));
+        const refreshed = this.getVaultFileByPath(file.path);
+        this.syncIndex.set(file.path, {
+          localSignature: refreshed ? this.buildSyncSignature(refreshed) : this.buildSyncSignature(file),
+          remoteSignature: remote?.signature ?? `${file.stat.mtime}:${binary.byteLength}`,
+          remotePath,
+        });
         evicted += 1;
       }
 
@@ -1280,7 +1570,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async listRemoteTree(rootFolder: string): Promise<RemoteInventory> {
-    const files = new Set<string>();
+    const files = new Map<string, RemoteFileState>();
     const directories = new Set<string>();
     const pending = [this.normalizeFolder(rootFolder)];
     const visited = new Set<string>();
@@ -1300,7 +1590,9 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           continue;
         }
 
-        files.add(entry.remotePath);
+        if (entry.file) {
+          files.set(entry.remotePath, entry.file);
+        }
       }
     }
 
@@ -1319,7 +1611,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     });
 
     if (response.status === 404) {
-      return [] as Array<{ remotePath: string; isCollection: boolean }>;
+      return [] as Array<{ remotePath: string; isCollection: boolean; file?: RemoteFileState }>;
     }
 
     if (response.status < 200 || response.status >= 300) {
@@ -1330,14 +1622,14 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return this.parsePropfindDirectoryListing(xmlText, requestedPath);
   }
 
-  private parsePropfindDirectoryListing(xmlText: string, requestedPath: string) {
+  private parsePropfindDirectoryListing(xmlText: string, requestedPath: string, includeRequested = false) {
     const parser = new DOMParser();
     const document = parser.parseFromString(xmlText, "application/xml");
     if (document.getElementsByTagName("parsererror").length > 0) {
       throw new Error(this.t("无法解析 WebDAV 目录清单。", "Failed to parse the WebDAV directory listing."));
     }
 
-    const entries = new Map<string, { remotePath: string; isCollection: boolean }>();
+    const entries = new Map<string, { remotePath: string; isCollection: boolean; file?: RemoteFileState }>();
     for (const element of Array.from(document.getElementsByTagName("*"))) {
       if (element.localName !== "response") {
         continue;
@@ -1356,15 +1648,36 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       const isCollection = this.xmlTreeHasLocalName(element, "collection");
       const normalizedPath = isCollection ? this.normalizeFolder(remotePath) : remotePath.replace(/\/+$/, "");
       if (
-        normalizedPath === requestedPath ||
-        normalizedPath === requestedPath.replace(/\/+$/, "")
+        !includeRequested &&
+        (
+          normalizedPath === requestedPath ||
+          normalizedPath === requestedPath.replace(/\/+$/, "")
+        )
       ) {
         continue;
       }
 
+      const sizeText = this.getXmlLocalNameText(element, "getcontentlength");
+      const parsedSize = Number.parseInt(sizeText, 10);
+      const size = Number.isFinite(parsedSize) ? parsedSize : 0;
+      const modifiedText = this.getXmlLocalNameText(element, "getlastmodified");
+      const parsedMtime = Date.parse(modifiedText);
+      const lastModified = Number.isFinite(parsedMtime) ? parsedMtime : 0;
+
       entries.set(normalizedPath, {
         remotePath: normalizedPath,
         isCollection,
+        file: isCollection
+          ? undefined
+          : {
+              remotePath: normalizedPath,
+              lastModified,
+              size,
+              signature: this.buildRemoteSyncSignature({
+                lastModified,
+                size,
+              }),
+            },
       });
     }
 
