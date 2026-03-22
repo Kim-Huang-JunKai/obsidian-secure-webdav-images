@@ -13,10 +13,8 @@
   TAbstractFile,
   TFile,
   normalizePath,
+  requestUrl as obsidianRequestUrl,
 } from "obsidian";
-import { createHash } from "node:crypto";
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
 
 type SecureWebdavSettings = {
   webdavUrl: string;
@@ -540,7 +538,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.ensureConfigured();
     const binary = await this.app.vault.readBinary(file);
     const prepared = await this.prepareUploadPayload(binary, this.getMimeType(file.extension), file.name);
-    const remoteName = this.buildRemoteFileNameFromBinary(prepared.fileName, prepared.binary);
+    const remoteName = await this.buildRemoteFileNameFromBinary(prepared.fileName, prepared.binary);
     const remotePath = this.buildRemotePath(remoteName);
     await this.uploadBinary(remotePath, prepared.binary, prepared.mimeType);
     const remoteUrl = `${SECURE_PROTOCOL}//${remotePath}`;
@@ -576,7 +574,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       this.normalizeImageMimeType(contentType, fileName),
       fileName,
     );
-    const remoteName = this.buildRemoteFileNameFromBinary(prepared.fileName, prepared.binary);
+    const remoteName = await this.buildRemoteFileNameFromBinary(prepared.fileName, prepared.binary);
     const remotePath = this.buildRemotePath(remoteName);
     await this.uploadBinary(remotePath, prepared.binary, prepared.mimeType);
     const remoteUrl = `${SECURE_PROTOCOL}//${remotePath}`;
@@ -1092,7 +1090,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         throw new Error(`GET failed with status ${response.status}`);
       }
 
-      const hydrated = Buffer.from(response.arrayBuffer).toString("utf8");
+      const hydrated = this.decodeUtf8(response.arrayBuffer);
       await this.app.vault.modify(file, hydrated);
       new Notice(this.t(`已从远端恢复笔记：${file.basename}`, `Restored note from remote: ${file.basename}`), 6000);
     } catch (error) {
@@ -1319,7 +1317,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       throw new Error(`PROPFIND failed for ${requestedPath} with status ${response.status}`);
     }
 
-    const xmlText = Buffer.from(response.arrayBuffer).toString("utf8");
+    const xmlText = this.decodeUtf8(response.arrayBuffer);
     return this.parsePropfindDirectoryListing(xmlText, requestedPath);
   }
 
@@ -1513,7 +1511,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         task.mimeType || this.getMimeTypeFromFileName(task.fileName),
         task.fileName,
       );
-      const remoteName = this.buildRemoteFileNameFromBinary(prepared.fileName, prepared.binary);
+      const remoteName = await this.buildRemoteFileNameFromBinary(prepared.fileName, prepared.binary);
       const remotePath = this.buildRemotePath(remoteName);
       const response = await this.requestUrl({
         url: this.buildUploadUrl(remotePath),
@@ -1650,12 +1648,23 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private arrayBufferToBase64(buffer: ArrayBuffer) {
-    return Buffer.from(buffer).toString("base64");
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000;
+    let binary = "";
+    for (let index = 0; index < bytes.length; index += chunkSize) {
+      const chunk = bytes.subarray(index, index + chunkSize);
+      binary += String.fromCharCode(...chunk);
+    }
+    return btoa(binary);
   }
 
   private base64ToArrayBuffer(base64: string) {
-    const buf = Buffer.from(base64, "base64");
-    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer;
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
   }
 
   private buildClipboardFileName(mimeType: string) {
@@ -1814,10 +1823,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return `${this.normalizeFolder(this.settings.remoteFolder)}${fileName}`;
   }
 
-  private buildRemoteFileNameFromBinary(fileName: string, binary: ArrayBuffer) {
+  private async buildRemoteFileNameFromBinary(fileName: string, binary: ArrayBuffer) {
     const extension = this.getExtensionFromFileName(fileName);
     if (this.settings.namingStrategy === "hash") {
-      const hash = createHash("sha256").update(Buffer.from(binary)).digest("hex").slice(0, 16);
+      const hash = (await this.computeSha256Hex(binary)).slice(0, 16);
       return `${hash}.${extension}`;
     }
 
@@ -1834,7 +1843,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private buildAuthHeader() {
-    const token = Buffer.from(`${this.settings.username}:${this.settings.password}`, "utf8").toString("base64");
+    const token = this.arrayBufferToBase64(this.encodeUtf8(`${this.settings.username}:${this.settings.password}`));
     return `Basic ${token}`;
   }
 
@@ -2112,11 +2121,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       const probeName = `.secure-webdav-probe-${Date.now()}.txt`;
       const remotePath = this.buildRemotePath(probeName);
       const uploadUrl = this.buildUploadUrl(remotePath);
-      const probeBody = Buffer.from(`secure-webdav probe ${new Date().toISOString()}`, "utf8");
-      const probeArrayBuffer = probeBody.buffer.slice(
-        probeBody.byteOffset,
-        probeBody.byteOffset + probeBody.byteLength,
-      ) as ArrayBuffer;
+      const probeArrayBuffer = this.encodeUtf8(`secure-webdav probe ${new Date().toISOString()}`);
 
       const putResponse = await this.requestUrl({
         url: uploadUrl,
@@ -2186,72 +2191,35 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     followRedirects?: boolean;
     redirectCount?: number;
   }): Promise<{ status: number; headers: Record<string, string>; arrayBuffer: ArrayBuffer }> {
-    const target = new URL(options.url);
-    const transport = target.protocol === "https:" ? httpsRequest : httpRequest;
-    const bodyBuffer = options.body ? Buffer.from(options.body) : undefined;
-
-    return await new Promise((resolve, reject) => {
-      const req = transport(
-        target,
-        {
-          method: options.method,
-          headers: {
-            ...(options.headers ?? {}),
-            ...(bodyBuffer ? { "Content-Length": String(bodyBuffer.byteLength) } : {}),
-          },
-        },
-        (res) => {
-          const chunks: Buffer[] = [];
-          res.on("data", (chunk) => {
-            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-          });
-          res.on("end", async () => {
-            const merged = chunks.length > 0 ? Buffer.concat(chunks) : Buffer.alloc(0);
-            const location = res.headers.location;
-            const shouldRedirect =
-              options.followRedirects &&
-              !!location &&
-              [301, 302, 303, 307, 308].includes(res.statusCode ?? 0) &&
-              (options.redirectCount ?? 0) < 5;
-
-            if (shouldRedirect) {
-              try {
-                const redirected = await this.requestUrl({
-                  url: new URL(Array.isArray(location) ? location[0] : location, target).toString(),
-                  method: "GET",
-                  headers: options.headers,
-                  followRedirects: true,
-                  redirectCount: (options.redirectCount ?? 0) + 1,
-                });
-                resolve(redirected);
-              } catch (error) {
-                reject(error);
-              }
-              return;
-            }
-
-            resolve({
-              status: res.statusCode ?? 0,
-              headers: Object.fromEntries(
-                Object.entries(res.headers).map(([key, value]) => [key, Array.isArray(value) ? value.join(", ") : value ?? ""]),
-              ),
-              arrayBuffer: merged.buffer.slice(
-                merged.byteOffset,
-                merged.byteOffset + merged.byteLength,
-              ) as ArrayBuffer,
-            });
-          });
-        },
-      );
-
-      req.on("error", reject);
-
-      if (bodyBuffer) {
-        req.write(bodyBuffer);
-      }
-
-      req.end();
+    const response = await obsidianRequestUrl({
+      url: options.url,
+      method: options.method,
+      headers: options.headers,
+      body: options.body,
+      throw: false,
     });
+
+    return {
+      status: response.status,
+      headers: response.headers,
+      arrayBuffer: response.arrayBuffer,
+    };
+  }
+
+  private encodeUtf8(value: string) {
+    const bytes = new TextEncoder().encode(value);
+    return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  }
+
+  private decodeUtf8(buffer: ArrayBuffer) {
+    return new TextDecoder().decode(buffer);
+  }
+
+  private async computeSha256Hex(buffer: ArrayBuffer) {
+    const digest = await crypto.subtle.digest("SHA-256", buffer);
+    return Array.from(new Uint8Array(digest))
+      .map((value) => value.toString(16).padStart(2, "0"))
+      .join("");
   }
 }
 
