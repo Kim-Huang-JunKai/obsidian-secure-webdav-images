@@ -1,158 +1,162 @@
 # Secure WebDAV Images
 
-Secure WebDAV Images is an Obsidian plugin that:
+Secure WebDAV Images is an Obsidian plugin that separates images from the rest of the vault:
 
-- uploads note images to a dedicated WebDAV image folder
-- rewrites images as secure `secure-webdav` code blocks
-- renders those remote images in notes without public image URLs
-- syncs the rest of the vault to a separate remote notes folder
-- optionally keeps Markdown notes in a lazy on-demand local mode
-- can capture original `http/https` article images into WebDAV so notes no longer depend on the source site
+- note images are uploaded to a dedicated WebDAV image folder
+- notes and non-image attachments are synced to a separate remote notes folder
+- Markdown notes can optionally use a lazy local placeholder mode to reduce local storage pressure
+- pasted article images from `http/https` sources can be captured into your own WebDAV storage
 
 Chinese installation guide: [INSTALL.zh-CN.md](./INSTALL.zh-CN.md)
 
-## What It Solves
+## Before You Install
 
-If your vault contains many screenshots and pasted images, mobile devices become heavy very quickly. This plugin keeps the vault lightweight by separating only images to a dedicated remote folder, while notes and other non-image attachments keep their original paths and are synced separately.
+This plugin is designed for users who want:
 
-## Core Behavior
+- lighter mobile vault storage
+- private image hosting through WebDAV instead of public image URLs
+- a split model where images and notes are stored in different remote folders
 
-- Images are uploaded to the remote image folder and then removed locally.
-- Notes keep a secure code-block reference instead of a local image attachment.
-- Notes and non-image attachments are synced to a separate remote notes folder.
-- Sync is a reconciliation sync:
-  it compares local and remote state, uploads new or changed files, and deletes extra remote files.
-- Remote images that are no longer referenced by any note are deleted automatically during cleanup.
+This plugin may **not** be suitable if you need:
+
+- Git-level merge behavior
+- zero-risk multi-device conflict handling under all network conditions
+- guaranteed offline access to every note on every device
+
+If you are unsure, start with:
+
+- `Note local retention mode = Full local`
+- manual sync first
+- lazy notes only after you confirm your WebDAV remote is stable
+
+## Storage Model
+
+The plugin uses two separate remote folders:
+
+- `Image remote folder`
+  Stores uploaded images only.
+- `Remote notes folder`
+  Stores Markdown notes and non-image attachments.
+
+### Image storage
+
+- Local note images are uploaded to the remote image folder.
+- After upload succeeds, the local image file is removed.
+- Notes are rewritten to secure `secure-webdav` code blocks.
+
+### Note storage
+
+- In `Full local` mode, notes stay on the device.
+- In `Lazy notes` mode, stale Markdown notes can be replaced locally by a lightweight placeholder.
+- The **remote notes folder always stores the full note body**.
+- A lazy placeholder is **never allowed to upload as remote note content**.
+
+## Important Safety Notes
+
+### Lazy notes do not replace the remote source of truth
+
+In lazy mode:
+
+- the server keeps the full Markdown content
+- the local device may keep only a placeholder
+- the placeholder is only a local storage optimization
+
+### If remote note content goes missing
+
+The plugin uses a cautious two-step rule:
+
+1. The first confirmation keeps the local placeholder and refuses to upload the placeholder as note content.
+2. If the remote content is confirmed missing again, the local broken placeholder is removed automatically.
+
+This means the plugin now aims to avoid both of these failure modes:
+
+- uploading a placeholder and accidentally overwriting the remote full note
+- keeping a broken placeholder forever after the remote content has already disappeared
+
+### Delete propagation is tombstone-based
+
+Normal note deletion is no longer inferred only from timestamps.
+
+The plugin writes an explicit remote deletion tombstone and prefers that tombstone during reconciliation. A local note is deleted only when the tombstone is authoritative and the local copy has not changed since the last successful sync.
+
+## Recent Safety Fixes In 0.0.8
+
+Version `0.0.8` tightened several high-risk paths:
+
+- lazy placeholders are blocked from uploading as remote note bodies
+- remote deletion now uses tombstones with remote version fingerprints
+- unchanged local notes can follow an authoritative tombstone
+- locally modified notes are protected from old tombstones
+- lazy note eviction verifies remote round-trip readability before replacing the local body with a placeholder
+- broken lazy placeholders are no longer kept forever when the remote content is repeatedly confirmed missing
 
 ## Settings
 
 ### Connection
 
 - `WebDAV base URL`
-  Example: `http://your-webdav-host:port`
 - `Username`
-  Your WebDAV account name.
 - `Password`
-  Hidden by default. You can toggle show or hide in the settings panel.
 - `Image remote folder`
-  Dedicated remote folder for images, for example `remote-images`
 - `Remote notes folder`
-  Dedicated remote folder for notes and non-image attachments, for example `remote-notes`
 
 ### Sync
 
 - `Auto sync frequency`
-  The reconciliation sync interval in minutes.
-  Set `0` to disable automatic sync.
+  Set minutes. Use `0` to disable auto sync.
 - `Note local retention mode`
-  - `Full local`: Markdown notes always stay on the device.
-  - `Lazy notes`: stale Markdown notes can be replaced with a local placeholder and restored from the remote notes folder when opened.
+  - `Full local`
+  - `Lazy notes`
 - `Note eviction days`
-  Only used in `Lazy notes` mode. Notes not opened within this number of days may be replaced with local placeholders after sync.
+  Used only in `Lazy notes` mode.
 
 ### One-time tools
 
 - `Run migration`
-  Scans the whole vault, uploads original Obsidian local image embeds such as `![]()` and `![[...]]`, rewrites them to `secure-webdav` code blocks, and removes the migrated local image files when safe.
+  Migrates original Obsidian local image embeds such as `![](...)` and `![[...]]` into secure remote image references.
 
 ## Commands
 
-The plugin currently exposes these commands in Obsidian:
-
 ### `Upload local images in current note to WebDAV`
 
-Use this when a note already contains normal local image embeds and you want to convert only the current note.
+Converts only the current note's local image embeds:
 
-What it does:
-
-- scans the current note
-- finds local image embeds like `![]()` and `![[...]]`
-- uploads those images to the remote image folder
-- rewrites them as `secure-webdav` code blocks
-- deletes the local image files after a successful upload
+- uploads images to the remote image folder
+- rewrites embeds to `secure-webdav` code blocks
+- removes local image files after successful upload
 
 ### `Test WebDAV connection`
 
-Use this to verify the WebDAV server before real usage.
+Checks the WebDAV read/write/delete chain by performing:
 
-What it does:
-
-- creates a temporary probe file
-- uploads it with `PUT`
-- reads it back with `GET`
-- deletes it with `DELETE`
-
-If this command succeeds, the basic WebDAV read/write/delete chain is available.
+- `PUT`
+- `GET`
+- `DELETE`
 
 ### `Sync vault content to WebDAV`
 
-Use this to synchronize notes and non-image attachments.
+Runs reconciliation sync for notes and non-image attachments:
 
-What it does:
-
-- compares the local vault with the remote notes folder
 - uploads new or changed files
+- downloads remote changes
 - skips unchanged files
-- deletes remote files that no longer exist locally
-- cleans up extra remote directories when possible
-- also clears orphaned remote images that are no longer referenced by any note
+- deletes remote note files that were explicitly removed
+- removes extra remote directories when safe
 
-This is not a simple upload command. It is a reconciliation sync with local state as the source of truth.
+## What Sync Does Not Promise
+
+- It is not a Git replacement.
+- It does not provide line-level merge resolution.
+- Remote image cleanup is currently conservative for safety and may leave redundant files behind.
+- If your remote storage is unreliable, do not rely on `Lazy notes` until you have verified the remote thoroughly.
 
 ## Recommended Workflow
 
-### Daily image workflow
-
-1. Paste or drag an image into a note.
-2. The plugin uploads the image automatically.
-3. The local image file is removed after upload.
-4. The note keeps a `secure-webdav` code block reference.
-5. The image can still be viewed inside Obsidian.
-
-### Existing note migration workflow
-
-1. Open plugin settings.
-2. Click `Run migration`.
-3. Wait for the vault-wide scan to complete.
-4. Review a few notes to confirm the old local image embeds were converted.
-5. Run `Sync vault content to WebDAV` to reconcile notes and attachments.
-
-### Manual sync workflow
-
-1. Finish editing notes.
-2. Click `Sync now` in plugin settings, or run `Sync vault content to WebDAV`.
-3. Check the sync status panel for the latest result.
-
-## Storage Format
-
-New remote images are stored as secure code blocks:
-
-````md
-```secure-webdav
-path: remote-images/example.png
-alt: Example image
-```
-````
-
-This format is easier to control and migrate than old HTML span-based placeholders.
-
-## Notes About Sync Scope
-
-- Images are separated to the image remote folder only.
-- Notes and non-image attachments are synced to the remote notes folder.
-- `.obsidian` is skipped.
-- The plugin's own directory is skipped.
-- Image files are skipped from content sync because they are handled by the image pipeline.
-
-## Notes About Lazy Notes
-
-In `Lazy notes` mode:
-
-- Markdown notes can be replaced locally with a lightweight placeholder
-- opening that note restores the full content from the remote notes folder
-- this helps reduce storage pressure on mobile devices
-
-This mode currently targets Markdown notes only.
+1. Configure WebDAV and remote folders.
+2. Run `Test WebDAV connection`.
+3. Migrate old local image embeds if needed.
+4. Use `Full local` mode first.
+5. After validating remote note integrity, optionally enable `Lazy notes`.
 
 ## Development
 
@@ -164,9 +168,9 @@ npx tsc --noEmit
 
 ## Local-only Files
 
-The following files are intentionally not tracked:
+These are intentionally not tracked:
 
 - `data.json`
 - `node_modules/`
 
-`data.json` contains local secrets and machine-specific state, so it should not be committed.
+`data.json` contains local machine state and secrets and must not be committed.

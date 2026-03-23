@@ -62,6 +62,18 @@ type RemoteFileState = {
   signature: string;
 };
 
+type DeletionTombstone = {
+  path: string;
+  deletedAt: number;
+  remoteSignature?: string;
+};
+
+type MissingLazyRemoteRecord = {
+  firstDetectedAt: number;
+  lastDetectedAt: number;
+  missCount: number;
+};
+
 type RemoteInventory = {
   files: Map<string, RemoteFileState>;
   directories: Set<string>;
@@ -102,9 +114,13 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   private remoteCleanupInFlight = new Set<string>();
   private noteAccessTimestamps = new Map<string, number>();
   private syncIndex = new Map<string, SyncIndexEntry>();
+  private missingLazyRemoteNotes = new Map<string, MissingLazyRemoteRecord>();
   private lastVaultSyncAt = 0;
   private lastVaultSyncStatus = "";
   private syncInProgress = false;
+
+  private readonly deletionFolderSuffix = ".__secure-webdav-deletions__/";
+  private readonly missingLazyRemoteConfirmations = 2;
 
   async onload() {
     await this.loadPluginState();
@@ -213,6 +229,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       this.queue = [];
       this.noteAccessTimestamps = new Map();
       this.syncIndex = new Map();
+      this.missingLazyRemoteNotes = new Map();
       return;
     }
 
@@ -222,6 +239,21 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       this.queue = Array.isArray(candidate.queue) ? (candidate.queue as UploadTask[]) : [];
       this.noteAccessTimestamps = new Map(
         Object.entries((candidate.noteAccessTimestamps as Record<string, number> | undefined) ?? {}),
+      );
+      this.missingLazyRemoteNotes = new Map(
+        Object.entries((candidate.missingLazyRemoteNotes as Record<string, MissingLazyRemoteRecord> | undefined) ?? {})
+          .filter(([, value]) => {
+            if (!value || typeof value !== "object") {
+              return false;
+            }
+            const record = value as Record<string, unknown>;
+            return (
+              typeof record.firstDetectedAt === "number" &&
+              typeof record.lastDetectedAt === "number" &&
+              typeof record.missCount === "number"
+            );
+          })
+          .map(([path, value]) => [path, value as MissingLazyRemoteRecord]),
       );
       this.syncIndex = new Map();
       for (const [path, rawEntry] of Object.entries((candidate.syncIndex as Record<string, unknown> | undefined) ?? {})) {
@@ -242,6 +274,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.queue = [];
     this.noteAccessTimestamps = new Map();
     this.syncIndex = new Map();
+    this.missingLazyRemoteNotes = new Map();
     this.lastVaultSyncAt = 0;
     this.lastVaultSyncStatus = "";
     this.normalizeEffectiveSettings();
@@ -273,6 +306,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       settings: this.settings,
       queue: this.queue,
       noteAccessTimestamps: Object.fromEntries(this.noteAccessTimestamps.entries()),
+      missingLazyRemoteNotes: Object.fromEntries(this.missingLazyRemoteNotes.entries()),
       syncIndex: Object.fromEntries(this.syncIndex.entries()),
       lastVaultSyncAt: this.lastVaultSyncAt,
       lastVaultSyncStatus: this.lastVaultSyncStatus,
@@ -368,9 +402,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.noteRemoteRefs.set(file.path, nextRefs);
 
     const removed = [...previousRefs].filter((value) => !nextRefs.has(value));
-    for (const remotePath of removed) {
-      await this.deleteRemoteIfUnreferenced(remotePath);
-    }
+    void removed;
   }
 
   private async handleVaultDelete(file: TAbstractFile) {
@@ -379,15 +411,15 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     if (!this.shouldSkipContentSyncPath(file.path)) {
-      await this.deleteRemoteSyncedEntry(file.path);
+      await this.writeDeletionTombstone(file.path, this.syncIndex.get(file.path)?.remoteSignature);
+      this.syncIndex.delete(file.path);
+      await this.savePluginState();
     }
 
     if (file.extension === "md") {
       const previousRefs = this.noteRemoteRefs.get(file.path) ?? new Set<string>();
       this.noteRemoteRefs.delete(file.path);
-      for (const remotePath of previousRefs) {
-        await this.deleteRemoteIfUnreferenced(remotePath);
-      }
+      void previousRefs;
     }
   }
 
@@ -397,7 +429,9 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     if (!this.shouldSkipContentSyncPath(oldPath)) {
-      await this.deleteRemoteSyncedEntry(oldPath);
+      await this.writeDeletionTombstone(oldPath, this.syncIndex.get(oldPath)?.remoteSignature);
+      this.syncIndex.delete(oldPath);
+      await this.savePluginState();
     }
 
     if (file.extension === "md") {
@@ -437,37 +471,9 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async deleteRemoteIfUnreferenced(remotePath: string) {
-    if (!this.settings.deleteRemoteWhenUnreferenced) {
-      return;
-    }
-
-    if (this.remoteCleanupInFlight.has(remotePath)) {
-      return;
-    }
-
-    const stillReferenced = [...this.noteRemoteRefs.values()].some((refs) => refs.has(remotePath));
-    if (stillReferenced) {
-      return;
-    }
-
-    this.remoteCleanupInFlight.add(remotePath);
-    try {
-      const response = await this.requestUrl({
-        url: this.buildUploadUrl(remotePath),
-        method: "DELETE",
-        headers: {
-          Authorization: this.buildAuthHeader(),
-        },
-      });
-
-      if (response.status !== 404 && (response.status < 200 || response.status >= 300)) {
-        throw new Error(`DELETE failed with status ${response.status}`);
-      }
-    } catch (error) {
-      console.error("Failed to delete unreferenced remote image", remotePath, error);
-    } finally {
-      this.remoteCleanupInFlight.delete(remotePath);
-    }
+    void remotePath;
+    // Disabled intentionally: local-only reference checks are not safe enough
+    // for cross-device deletion of shared remote images.
   }
 
   private async buildUploadReplacements(content: string, noteFile: TFile, uploadCache?: Map<string, string>) {
@@ -992,6 +998,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       await this.rebuildReferenceIndex();
 
       const remoteInventory = await this.listRemoteTree(this.settings.vaultSyncRemoteFolder);
+      const deletionTombstones = await this.readDeletionTombstones();
       const remoteFiles = remoteInventory.files;
       let restoredFromRemote = 0;
       let deletedRemoteFiles = 0;
@@ -1014,6 +1021,20 @@ export default class SecureWebdavImagesPlugin extends Plugin {
             continue;
           }
 
+          const tombstone = deletionTombstones.get(path);
+          if (tombstone && this.isTombstoneAuthoritative(tombstone, remote)) {
+            await this.deleteRemoteContentFile(remote.remotePath);
+            remoteFiles.delete(remote.remotePath);
+            this.syncIndex.delete(path);
+            deletedRemoteFiles += 1;
+            continue;
+          }
+
+          if (tombstone) {
+            await this.deleteDeletionTombstone(path);
+            deletionTombstones.delete(path);
+          }
+
           if (previous.remoteSignature && previous.remoteSignature !== remote.signature) {
             await this.downloadRemoteFileToVault(path, remote);
             this.syncIndex.set(path, {
@@ -1025,16 +1046,20 @@ export default class SecureWebdavImagesPlugin extends Plugin {
             continue;
           }
 
-          await this.deleteRemoteContentFile(remote.remotePath);
-          remoteFiles.delete(remote.remotePath);
-          this.syncIndex.delete(path);
-          deletedRemoteFiles += 1;
+          await this.downloadRemoteFileToVault(path, remote);
+          this.syncIndex.set(path, {
+            localSignature: remote.signature,
+            remoteSignature: remote.signature,
+            remotePath: remote.remotePath,
+          });
+          restoredFromRemote += 1;
         }
       }
 
       let uploaded = 0;
       let skipped = 0;
       let missingRemoteBackedNotes = 0;
+      let purgedMissingLazyNotes = 0;
 
       files = this.collectVaultContentFiles();
       currentPaths = new Set(files.map((file) => file.path));
@@ -1043,6 +1068,19 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         if (!vaultPath || currentPaths.has(vaultPath)) {
           continue;
         }
+
+      const tombstone = deletionTombstones.get(vaultPath);
+      if (tombstone) {
+        if (this.isTombstoneAuthoritative(tombstone, remote)) {
+          await this.deleteRemoteContentFile(remote.remotePath);
+          remoteFiles.delete(remote.remotePath);
+          deletedRemoteFiles += 1;
+          continue;
+        }
+
+        await this.deleteDeletionTombstone(vaultPath);
+        deletionTombstones.delete(vaultPath);
+      }
 
         await this.downloadRemoteFileToVault(vaultPath, remote);
         this.syncIndex.set(vaultPath, {
@@ -1070,12 +1108,29 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           const stub = this.parseNoteStub(content);
           if (stub) {
             const stubRemote = remoteFiles.get(stub.remotePath);
-            if (!stubRemote) {
+            const tombstone = deletionTombstones.get(file.path);
+            if (!stubRemote && tombstone) {
               await this.removeLocalVaultFile(file);
               this.syncIndex.delete(file.path);
+              this.clearMissingLazyRemote(file.path);
               deletedLocalFiles += 1;
               deletedLocalStubs += 1;
               continue;
+            }
+            if (!stubRemote) {
+              const missingRecord = this.markMissingLazyRemote(file.path);
+              if (missingRecord.missCount >= this.missingLazyRemoteConfirmations) {
+                await this.removeLocalVaultFile(file);
+                this.syncIndex.delete(file.path);
+                this.clearMissingLazyRemote(file.path);
+                deletedLocalFiles += 1;
+                deletedLocalStubs += 1;
+                purgedMissingLazyNotes += 1;
+                continue;
+              }
+              missingRemoteBackedNotes += 1;
+            } else {
+              this.clearMissingLazyRemote(file.path);
             }
             this.syncIndex.set(file.path, {
               localSignature,
@@ -1087,14 +1142,30 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           }
         }
 
-        if (!remote) {
-          if (previous && this.shouldDeleteLocalWhenRemoteMissing(file, previous)) {
+        const tombstone = deletionTombstones.get(file.path);
+        const unchangedSinceLastSync = previous ? previous.localSignature === localSignature : false;
+        if (tombstone) {
+          if (
+            unchangedSinceLastSync &&
+            this.shouldDeleteLocalFromTombstone(file, tombstone) &&
+            this.isTombstoneAuthoritative(tombstone, remote)
+          ) {
             await this.removeLocalVaultFile(file);
             this.syncIndex.delete(file.path);
             deletedLocalFiles += 1;
+            if (remote) {
+              await this.deleteRemoteContentFile(remote.remotePath);
+              remoteFiles.delete(remote.remotePath);
+              deletedRemoteFiles += 1;
+            }
             continue;
           }
 
+          await this.deleteDeletionTombstone(file.path);
+          deletionTombstones.delete(file.path);
+        }
+
+        if (!remote) {
           const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
           this.syncIndex.set(file.path, {
             localSignature,
@@ -1113,6 +1184,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
               remoteSignature,
               remotePath,
             });
+            await this.deleteDeletionTombstone(file.path);
             skipped += 1;
             continue;
           }
@@ -1136,6 +1208,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
             remotePath,
           });
           remoteFiles.set(remotePath, uploadedRemote);
+          await this.deleteDeletionTombstone(file.path);
           uploaded += 1;
           continue;
         }
@@ -1167,6 +1240,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
             remotePath,
           });
           remoteFiles.set(remotePath, uploadedRemote);
+          await this.deleteDeletionTombstone(file.path);
           uploaded += 1;
           continue;
         }
@@ -1190,6 +1264,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           remotePath,
         });
         remoteFiles.set(remotePath, uploadedRemote);
+        await this.deleteDeletionTombstone(file.path);
         uploaded += 1;
       }
 
@@ -1202,8 +1277,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
-        `已双向同步：上传 ${uploaded} 个文件，从远端拉取 ${restoredFromRemote + downloadedOrUpdated} 个文件，跳过 ${skipped} 个未变化文件，删除远端内容 ${deletedRemoteFiles} 个、本地内容 ${deletedLocalFiles} 个${deletedLocalStubs > 0 ? `（其中失效占位笔记 ${deletedLocalStubs} 篇）` : ""}，清理远端空目录 ${deletedRemoteDirectories} 个，清理冗余图片 ${imageCleanup.deletedFiles} 张、目录 ${imageCleanup.deletedDirectories} 个${evictedNotes > 0 ? `，回收本地旧笔记 ${evictedNotes} 篇` : ""}${missingRemoteBackedNotes > 0 ? `，并发现 ${missingRemoteBackedNotes} 篇按需笔记缺少远端正文` : ""}。`,
-        `Bidirectional sync uploaded ${uploaded} file(s), pulled ${restoredFromRemote + downloadedOrUpdated} file(s) from remote, skipped ${skipped} unchanged file(s), deleted ${deletedRemoteFiles} remote content file(s) and ${deletedLocalFiles} local file(s)${deletedLocalStubs > 0 ? ` (including ${deletedLocalStubs} stale stub note(s))` : ""}, removed ${deletedRemoteDirectories} remote director${deletedRemoteDirectories === 1 ? "y" : "ies"}, cleaned ${imageCleanup.deletedFiles} orphaned remote image(s) plus ${imageCleanup.deletedDirectories} director${imageCleanup.deletedDirectories === 1 ? "y" : "ies"}${evictedNotes > 0 ? `, and evicted ${evictedNotes} stale local note(s)` : ""}${missingRemoteBackedNotes > 0 ? `, while detecting ${missingRemoteBackedNotes} lazy note(s) missing their remote content` : ""}.`,
+        `已双向同步：上传 ${uploaded} 个文件，从远端拉取 ${restoredFromRemote + downloadedOrUpdated} 个文件，跳过 ${skipped} 个未变化文件，删除远端内容 ${deletedRemoteFiles} 个、本地内容 ${deletedLocalFiles} 个${deletedLocalStubs > 0 ? `（其中失效占位笔记 ${deletedLocalStubs} 篇）` : ""}，清理远端空目录 ${deletedRemoteDirectories} 个，清理冗余图片 ${imageCleanup.deletedFiles} 张、目录 ${imageCleanup.deletedDirectories} 个${evictedNotes > 0 ? `，回收本地旧笔记 ${evictedNotes} 篇` : ""}${missingRemoteBackedNotes > 0 ? `，并发现 ${missingRemoteBackedNotes} 篇按需笔记缺少远端正文` : ""}${purgedMissingLazyNotes > 0 ? `，确认清理失效占位笔记 ${purgedMissingLazyNotes} 篇` : ""}。`,
+        `Bidirectional sync uploaded ${uploaded} file(s), pulled ${restoredFromRemote + downloadedOrUpdated} file(s) from remote, skipped ${skipped} unchanged file(s), deleted ${deletedRemoteFiles} remote content file(s) and ${deletedLocalFiles} local file(s)${deletedLocalStubs > 0 ? ` (including ${deletedLocalStubs} stale stub note(s))` : ""}, removed ${deletedRemoteDirectories} remote director${deletedRemoteDirectories === 1 ? "y" : "ies"}, cleaned ${imageCleanup.deletedFiles} orphaned remote image(s) plus ${imageCleanup.deletedDirectories} director${imageCleanup.deletedDirectories === 1 ? "y" : "ies"}${evictedNotes > 0 ? `, and evicted ${evictedNotes} stale local note(s)` : ""}${missingRemoteBackedNotes > 0 ? `, while detecting ${missingRemoteBackedNotes} lazy note(s) missing their remote content` : ""}${purgedMissingLazyNotes > 0 ? `, and purged ${purgedMissingLazyNotes} confirmed broken lazy placeholder(s)` : ""}.`,
       );
       await this.savePluginState();
       if (showNotice) {
@@ -1245,6 +1320,127 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return `${remote.lastModified}:${remote.size}`;
   }
 
+  private buildDeletionFolder() {
+    return `${this.normalizeFolder(this.settings.vaultSyncRemoteFolder).replace(/\/$/, "")}${this.deletionFolderSuffix}`;
+  }
+
+  private buildDeletionRemotePath(vaultPath: string) {
+    const encoded = this.arrayBufferToBase64(this.encodeUtf8(vaultPath))
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+    return `${this.buildDeletionFolder()}${encoded}.json`;
+  }
+
+  private parseDeletionTombstoneBase64(value: string) {
+    const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+    return this.decodeUtf8(this.base64ToArrayBuffer(padded));
+  }
+
+  private remoteDeletionPathToVaultPath(remotePath: string) {
+    const root = this.buildDeletionFolder();
+    if (!remotePath.startsWith(root) || !remotePath.endsWith(".json")) {
+      return null;
+    }
+
+    const encoded = remotePath.slice(root.length, -".json".length);
+    try {
+      return this.parseDeletionTombstoneBase64(encoded);
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeDeletionTombstone(vaultPath: string, remoteSignature?: string) {
+    const payload: DeletionTombstone = {
+      path: vaultPath,
+      deletedAt: Date.now(),
+      remoteSignature,
+    };
+    await this.uploadBinary(
+      this.buildDeletionRemotePath(vaultPath),
+      this.encodeUtf8(JSON.stringify(payload)),
+      "application/json; charset=utf-8",
+    );
+  }
+
+  private async deleteDeletionTombstone(vaultPath: string) {
+    try {
+      await this.deleteRemoteContentFile(this.buildDeletionRemotePath(vaultPath));
+    } catch {
+      // Tombstone cleanup should not break the main sync flow.
+    }
+  }
+
+  private async readDeletionTombstone(vaultPath: string) {
+    const response = await this.requestUrl({
+      url: this.buildUploadUrl(this.buildDeletionRemotePath(vaultPath)),
+      method: "GET",
+      headers: {
+        Authorization: this.buildAuthHeader(),
+      },
+    });
+
+    if (response.status === 404) {
+      return null;
+    }
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`GET tombstone failed with status ${response.status}`);
+    }
+
+    return this.parseDeletionTombstonePayload(this.decodeUtf8(response.arrayBuffer));
+  }
+
+  private parseDeletionTombstonePayload(raw: string): DeletionTombstone | null {
+    try {
+      const parsed = JSON.parse(raw) as Partial<DeletionTombstone>;
+      if (!parsed || typeof parsed.path !== "string" || typeof parsed.deletedAt !== "number") {
+        return null;
+      }
+      if (parsed.remoteSignature !== undefined && typeof parsed.remoteSignature !== "string") {
+        return null;
+      }
+      return {
+        path: parsed.path,
+        deletedAt: parsed.deletedAt,
+        remoteSignature: parsed.remoteSignature,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async readDeletionTombstones() {
+    const tombstones = new Map<string, DeletionTombstone>();
+    const inventory = await this.listRemoteTree(this.buildDeletionFolder());
+    for (const remote of inventory.files.values()) {
+      const vaultPath = this.remoteDeletionPathToVaultPath(remote.remotePath);
+      if (!vaultPath) {
+        continue;
+      }
+
+      const response = await this.requestUrl({
+        url: this.buildUploadUrl(remote.remotePath),
+        method: "GET",
+        headers: {
+          Authorization: this.buildAuthHeader(),
+        },
+      });
+      if (response.status < 200 || response.status >= 300) {
+        continue;
+      }
+
+      const tombstone = this.parseDeletionTombstonePayload(this.decodeUtf8(response.arrayBuffer));
+      if (tombstone) {
+        tombstones.set(vaultPath, tombstone);
+      }
+    }
+
+    return tombstones;
+  }
+
   private remotePathToVaultPath(remotePath: string) {
     const root = this.normalizeFolder(this.settings.vaultSyncRemoteFolder);
     if (!remotePath.startsWith(root)) {
@@ -1258,41 +1454,25 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return remoteMtime > localMtime + 2000;
   }
 
-  private parseSyncSignature(signature: string) {
-    const [mtimeText, sizeText] = signature.split(":");
-    const mtime = Number.parseInt(mtimeText ?? "", 10);
-    const size = Number.parseInt(sizeText ?? "", 10);
-    if (!Number.isFinite(mtime) || !Number.isFinite(size)) {
-      return null;
+  private isTombstoneAuthoritative(
+    tombstone: DeletionTombstone,
+    remote?: Pick<RemoteFileState, "lastModified" | "signature"> | null,
+  ) {
+    const graceMs = 5000;
+    if (!remote) {
+      return true;
     }
 
-    return { mtime, size };
+    if (tombstone.remoteSignature) {
+      return remote.signature === tombstone.remoteSignature;
+    }
+
+    return remote.lastModified <= tombstone.deletedAt + graceMs;
   }
 
-  private shouldDeleteLocalWhenRemoteMissing(file: TFile, previous: SyncIndexEntry) {
-    if (!previous.remoteSignature) {
-      return false;
-    }
-
-    const currentSignature = this.buildSyncSignature(file);
-    if (previous.localSignature === currentSignature) {
-      return true;
-    }
-
-    const previousLocal = this.parseSyncSignature(previous.localSignature);
+  private shouldDeleteLocalFromTombstone(file: TFile, tombstone: DeletionTombstone) {
     const graceMs = 5000;
-    if (previousLocal && file.stat.size === previousLocal.size) {
-      const baseline = Math.max(previousLocal.mtime, this.lastVaultSyncAt || 0);
-      if (file.stat.mtime <= baseline + graceMs) {
-        return true;
-      }
-    }
-
-    if (this.lastVaultSyncAt > 0 && file.stat.mtime <= this.lastVaultSyncAt + graceMs) {
-      return true;
-    }
-
-    return false;
+    return file.stat.mtime <= tombstone.deletedAt + graceMs;
   }
 
   private getVaultFileByPath(path: string) {
@@ -1363,6 +1543,22 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
   }
 
+  private async verifyRemoteBinaryRoundTrip(remotePath: string, expected: ArrayBuffer) {
+    const response = await this.requestUrl({
+      url: this.buildUploadUrl(remotePath),
+      method: "GET",
+      headers: {
+        Authorization: this.buildAuthHeader(),
+      },
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      return false;
+    }
+
+    return this.arrayBuffersEqual(expected, response.arrayBuffer);
+  }
+
   private async statRemoteFile(remotePath: string) {
     const response = await this.requestUrl({
       url: this.buildUploadUrl(remotePath),
@@ -1387,6 +1583,18 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async uploadContentFileToRemote(file: TFile, remotePath: string) {
+    if (file.extension === "md") {
+      const content = await this.app.vault.read(file);
+      if (this.parseNoteStub(content)) {
+        throw new Error(
+          this.t(
+            "拒绝把按需加载占位笔记上传为远端正文。",
+            "Refusing to upload a lazy-note placeholder as remote note content.",
+          ),
+        );
+      }
+    }
+
     const binary = await this.app.vault.readBinary(file);
     await this.uploadBinary(remotePath, binary, this.getMimeType(file.extension));
     const remote = await this.statRemoteFile(remotePath);
@@ -1427,19 +1635,44 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     try {
       const remote = await this.statRemoteFile(stub.remotePath);
       if (!remote) {
-        await this.removeLocalVaultFile(file);
-        this.syncIndex.delete(file.path);
+        const tombstone = await this.readDeletionTombstone(file.path);
+        if (tombstone) {
+          await this.removeLocalVaultFile(file);
+          this.syncIndex.delete(file.path);
+          this.clearMissingLazyRemote(file.path);
+          await this.savePluginState();
+          new Notice(
+            this.t(
+              `远端正文不存在，已移除本地占位笔记：${file.basename}`,
+              `Remote note missing, removed local placeholder: ${file.basename}`,
+            ),
+            6000,
+          );
+          return;
+        }
+
+        const missingRecord = this.markMissingLazyRemote(file.path);
+        if (missingRecord.missCount >= this.missingLazyRemoteConfirmations) {
+          await this.removeLocalVaultFile(file);
+          this.syncIndex.delete(file.path);
+          this.clearMissingLazyRemote(file.path);
+          await this.savePluginState();
+          new Notice(
+            this.t(
+              `远端正文连续缺失，已移除本地失效占位笔记：${file.basename}`,
+              `Remote note was missing repeatedly, removed local broken placeholder: ${file.basename}`,
+            ),
+            8000,
+          );
+          return;
+        }
+
         await this.savePluginState();
-        new Notice(
-          this.t(
-            `远端正文不存在，已移除本地占位笔记：${file.basename}`,
-            `Remote note missing, removed local placeholder: ${file.basename}`,
-          ),
-          6000,
-        );
+        new Notice(this.t("远端正文不存在，当前先保留本地占位笔记以防临时异常；若再次确认缺失，将自动清理该占位。", "Remote note is missing. The local placeholder was kept for now in case this is transient; it will be cleaned automatically if the remote is still missing on the next confirmation."), 8000);
         return;
       }
 
+      this.clearMissingLazyRemote(file.path);
       await this.downloadRemoteFileToVault(file.path, remote, file);
       const refreshed = this.getVaultFileByPath(file.path);
       this.syncIndex.set(file.path, {
@@ -1487,34 +1720,29 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async reconcileRemoteImages() {
-    const remoteInventory = await this.listRemoteTree(this.settings.remoteFolder);
-    const expectedFiles = new Set<string>();
-    const imageRoot = this.normalizeFolder(this.settings.remoteFolder);
+    return { deletedFiles: 0, deletedDirectories: 0 };
+  }
 
-    for (const refs of this.noteRemoteRefs.values()) {
-      for (const remotePath of refs) {
-        if (remotePath.startsWith(imageRoot)) {
-          expectedFiles.add(remotePath);
+  private markMissingLazyRemote(path: string) {
+    const now = Date.now();
+    const previous = this.missingLazyRemoteNotes.get(path);
+    const next: MissingLazyRemoteRecord = previous
+      ? {
+          firstDetectedAt: previous.firstDetectedAt,
+          lastDetectedAt: now,
+          missCount: previous.missCount + 1,
         }
-      }
-    }
+      : {
+          firstDetectedAt: now,
+          lastDetectedAt: now,
+          missCount: 1,
+        };
+    this.missingLazyRemoteNotes.set(path, next);
+    return next;
+  }
 
-    let deletedFiles = 0;
-    for (const remotePath of [...remoteInventory.files.keys()].sort((a, b) => b.localeCompare(a))) {
-      if (expectedFiles.has(remotePath)) {
-        continue;
-      }
-
-      await this.deleteRemoteContentFile(remotePath);
-      deletedFiles += 1;
-    }
-
-    const deletedDirectories = await this.deleteExtraRemoteDirectories(
-      remoteInventory.directories,
-      this.buildExpectedRemoteDirectories(expectedFiles, this.settings.remoteFolder),
-    );
-
-    return { deletedFiles, deletedDirectories };
+  private clearMissingLazyRemote(path: string) {
+    this.missingLazyRemoteNotes.delete(path);
   }
 
   private parseNoteStub(content: string) {
@@ -1579,7 +1807,14 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         const binary = await this.app.vault.readBinary(file);
         const remotePath = this.buildVaultSyncRemotePath(file.path);
         await this.uploadBinary(remotePath, binary, "text/markdown; charset=utf-8");
+        const verified = await this.verifyRemoteBinaryRoundTrip(remotePath, binary);
+        if (!verified) {
+          throw new Error(this.t("远端正文校验失败，已取消回收本地笔记。", "Remote note verification failed, local note eviction was cancelled."));
+        }
         const remote = await this.statRemoteFile(remotePath);
+        if (!remote) {
+          throw new Error(this.t("远端正文元数据缺失，已取消回收本地笔记。", "Remote note metadata is missing, local note eviction was cancelled."));
+        }
         await this.app.vault.modify(file, this.buildNoteStub(file));
         const refreshed = this.getVaultFileByPath(file.path);
         this.syncIndex.set(file.path, {
@@ -2051,6 +2286,22 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       bytes[index] = binary.charCodeAt(index);
     }
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  }
+
+  private arrayBuffersEqual(left: ArrayBuffer, right: ArrayBuffer) {
+    const a = new Uint8Array(left);
+    const b = new Uint8Array(right);
+    if (a.length !== b.length) {
+      return false;
+    }
+
+    for (let index = 0; index < a.length; index += 1) {
+      if (a[index] !== b[index]) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   private buildClipboardFileName(mimeType: string) {
