@@ -79,9 +79,33 @@ Normal note deletion is no longer inferred only from timestamps.
 
 The plugin writes an explicit remote deletion tombstone and prefers that tombstone during reconciliation. A local note is deleted only when the tombstone is authoritative and the local copy has not changed since the last successful sync.
 
-## Recent Safety Fixes In 0.0.8
+## Upgrade Notes For 0.0.9
 
-Version `0.0.8` tightened several high-risk paths:
+Version `0.0.9` fixes a high-risk race around pasted images and note sync.
+
+What happened before:
+
+- an image could finish uploading to the remote image folder
+- the open note buffer might already contain the new secure image block
+- but the vault file on disk could still lag behind for a short time
+- auto sync or prioritized note sync could then read the stale on-disk note body
+- the stale note body could be uploaded or win reconciliation, making it look like the image was deleted later
+
+What `0.0.9` changes:
+
+- Markdown note sync now prefers the currently open editor content over stale on-disk content
+- prioritized note sync after image insertion uses the live editor body too
+- Markdown sync signatures now follow current note content instead of relying only on `mtime + size`
+- lazy placeholders are still blocked from uploading as remote note bodies
+
+Why this version matters:
+
+- if you paste images and use auto sync, this upgrade is strongly recommended
+- if you saw images disappear after a short delay, this is the version that targets that failure mode directly
+
+## Recent Safety Fixes Before 0.0.9
+
+Version `0.0.8` tightened several other high-risk paths:
 
 - lazy placeholders are blocked from uploading as remote note bodies
 - remote deletion now uses tombstones with remote version fingerprints
@@ -89,6 +113,7 @@ Version `0.0.8` tightened several high-risk paths:
 - locally modified notes are protected from old tombstones
 - lazy note eviction verifies remote round-trip readability before replacing the local body with a placeholder
 - broken lazy placeholders are no longer kept forever when the remote content is repeatedly confirmed missing
+- auto sync now waits for image upload tasks to settle before reconciling note content, which prevents freshly uploaded image references from being overwritten by an older remote note body
 
 ## Settings
 

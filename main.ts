@@ -115,9 +115,13 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   private noteAccessTimestamps = new Map<string, number>();
   private syncIndex = new Map<string, SyncIndexEntry>();
   private missingLazyRemoteNotes = new Map<string, MissingLazyRemoteRecord>();
+  private pendingTaskPromises = new Map<string, Promise<void>>();
+  private priorityNoteSyncTimeouts = new Map<string, number>();
+  private priorityNoteSyncsInFlight = new Set<string>();
   private lastVaultSyncAt = 0;
   private lastVaultSyncStatus = "";
   private syncInProgress = false;
+  private autoSyncTickInProgress = false;
 
   private readonly deletionFolderSuffix = ".__secure-webdav-deletions__/";
   private readonly missingLazyRemoteConfirmations = 2;
@@ -204,6 +208,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         URL.revokeObjectURL(blobUrl);
       }
       this.blobUrls.clear();
+      for (const timeoutId of this.priorityNoteSyncTimeouts.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      this.priorityNoteSyncTimeouts.clear();
       for (const timeoutId of this.retryTimeouts.values()) {
         window.clearTimeout(timeoutId);
       }
@@ -220,6 +228,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       window.clearTimeout(timeoutId);
     }
     this.retryTimeouts.clear();
+    for (const timeoutId of this.priorityNoteSyncTimeouts.values()) {
+      window.clearTimeout(timeoutId);
+    }
+    this.priorityNoteSyncTimeouts.clear();
   }
 
   async loadPluginState() {
@@ -295,10 +307,22 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     const intervalMs = minutes * 60 * 1000;
     this.registerInterval(
       window.setInterval(() => {
-        void this.processPendingTasks();
-        void this.syncConfiguredVaultContent(false);
+        void this.runAutoSyncTick();
       }, intervalMs),
     );
+  }
+
+  private async runAutoSyncTick() {
+    if (this.autoSyncTickInProgress) {
+      return;
+    }
+
+    this.autoSyncTickInProgress = true;
+    try {
+      await this.syncConfiguredVaultContent(false);
+    } finally {
+      this.autoSyncTickInProgress = false;
+    }
   }
 
   async savePluginState() {
@@ -378,7 +402,6 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   async runManualSync() {
-    await this.processPendingTasks();
     await this.syncConfiguredVaultContent(true);
   }
 
@@ -401,8 +424,14 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     const previousRefs = this.noteRemoteRefs.get(file.path) ?? new Set<string>();
     this.noteRemoteRefs.set(file.path, nextRefs);
 
+    const added = [...nextRefs].filter((value) => !previousRefs.has(value));
     const removed = [...previousRefs].filter((value) => !nextRefs.has(value));
-    void removed;
+    if (added.length > 0) {
+      this.schedulePriorityNoteSync(file.path, "image-add");
+    }
+    if (removed.length > 0) {
+      this.schedulePriorityNoteSync(file.path, "image-remove");
+    }
   }
 
   private async handleVaultDelete(file: TAbstractFile) {
@@ -474,6 +503,101 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     void remotePath;
     // Disabled intentionally: local-only reference checks are not safe enough
     // for cross-device deletion of shared remote images.
+  }
+
+  private schedulePriorityNoteSync(notePath: string, reason: "image-add" | "image-remove") {
+    const existing = this.priorityNoteSyncTimeouts.get(notePath);
+    if (existing) {
+      window.clearTimeout(existing);
+    }
+
+    const delayMs = reason === "image-add" ? 1200 : 600;
+    const timeoutId = window.setTimeout(() => {
+      this.priorityNoteSyncTimeouts.delete(notePath);
+      void this.flushPriorityNoteSync(notePath, reason);
+    }, delayMs);
+    this.priorityNoteSyncTimeouts.set(notePath, timeoutId);
+  }
+
+  private async flushPriorityNoteSync(notePath: string, reason: "image-add" | "image-remove") {
+    if (this.priorityNoteSyncsInFlight.has(notePath)) {
+      return;
+    }
+
+    if (this.hasPendingImageWorkForNote(notePath) || this.syncInProgress || this.autoSyncTickInProgress) {
+      this.schedulePriorityNoteSync(notePath, reason);
+      return;
+    }
+
+    const file = this.getVaultFileByPath(notePath);
+    if (!(file instanceof TFile) || file.extension !== "md" || this.shouldSkipContentSyncPath(file.path)) {
+      return;
+    }
+
+    this.priorityNoteSyncsInFlight.add(notePath);
+    try {
+      this.ensureConfigured();
+
+      const content = await this.readMarkdownContentPreferEditor(file);
+      if (this.parseNoteStub(content)) {
+        return;
+      }
+
+      const remotePath = this.buildVaultSyncRemotePath(file.path);
+      const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, content);
+      this.syncIndex.set(file.path, {
+        localSignature: await this.buildCurrentLocalSignature(file, content),
+        remoteSignature: uploadedRemote.signature,
+        remotePath,
+      });
+      await this.deleteDeletionTombstone(file.path);
+      this.lastVaultSyncAt = Date.now();
+      this.lastVaultSyncStatus = this.t(
+        reason === "image-add"
+          ? `已优先同步图片新增后的笔记：${file.basename}`
+          : `已优先同步图片删除后的笔记：${file.basename}`,
+        reason === "image-add"
+          ? `Prioritized note sync finished after image add: ${file.basename}`
+          : `Prioritized note sync finished after image removal: ${file.basename}`,
+      );
+      await this.savePluginState();
+    } catch (error) {
+      console.error("Priority note sync failed", error);
+      this.lastVaultSyncAt = Date.now();
+      this.lastVaultSyncStatus = this.describeError(
+        this.t(
+          reason === "image-add" ? "图片新增后的笔记优先同步失败" : "图片删除后的笔记优先同步失败",
+          reason === "image-add" ? "Priority note sync after image add failed" : "Priority note sync after image removal failed",
+        ),
+        error,
+      );
+      await this.savePluginState();
+      this.schedulePriorityNoteSync(notePath, reason);
+    } finally {
+      this.priorityNoteSyncsInFlight.delete(notePath);
+    }
+  }
+
+  private hasPendingImageWorkForNote(notePath: string) {
+    if (this.queue.some((task) => task.notePath === notePath)) {
+      return true;
+    }
+
+    for (const taskId of this.processingTaskIds) {
+      const task = this.queue.find((item) => item.id === taskId);
+      if (task?.notePath === notePath) {
+        return true;
+      }
+    }
+
+    for (const [taskId] of this.pendingTaskPromises) {
+      const task = this.queue.find((item) => item.id === taskId);
+      if (task?.notePath === notePath) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private async buildUploadReplacements(content: string, noteFile: TFile, uploadCache?: Map<string, string>) {
@@ -995,6 +1119,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.syncInProgress = true;
     try {
       this.ensureConfigured();
+      const uploadsReady = await this.preparePendingUploadsForSync(showNotice);
+      if (!uploadsReady) {
+        return;
+      }
       await this.rebuildReferenceIndex();
 
       const remoteInventory = await this.listRemoteTree(this.settings.vaultSyncRemoteFolder);
@@ -1100,12 +1228,12 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         localRemotePaths.add(remotePath);
         const remote = remoteFiles.get(remotePath);
         const remoteSignature = remote?.signature ?? "";
-        const localSignature = this.buildSyncSignature(file);
         const previous = this.syncIndex.get(file.path);
+        const markdownContent = file.extension === "md" ? await this.readMarkdownContentPreferEditor(file) : null;
+        const localSignature = await this.buildCurrentLocalSignature(file, markdownContent ?? undefined);
 
         if (file.extension === "md") {
-          const content = await this.app.vault.read(file);
-          const stub = this.parseNoteStub(content);
+          const stub = this.parseNoteStub(markdownContent ?? "");
           if (stub) {
             const stubRemote = remoteFiles.get(stub.remotePath);
             const tombstone = deletionTombstones.get(file.path);
@@ -1166,7 +1294,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         }
 
         if (!remote) {
-          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent ?? undefined);
           this.syncIndex.set(file.path, {
             localSignature,
             remoteSignature: uploadedRemote.signature,
@@ -1193,7 +1321,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
             await this.downloadRemoteFileToVault(file.path, remote, file);
             const refreshed = this.getVaultFileByPath(file.path);
             this.syncIndex.set(file.path, {
-              localSignature: refreshed ? this.buildSyncSignature(refreshed) : remoteSignature,
+              localSignature: refreshed ? await this.buildCurrentLocalSignature(refreshed) : remoteSignature,
               remoteSignature,
               remotePath,
             });
@@ -1201,7 +1329,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
             continue;
           }
 
-          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent ?? undefined);
           this.syncIndex.set(file.path, {
             localSignature,
             remoteSignature: uploadedRemote.signature,
@@ -1224,7 +1352,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           await this.downloadRemoteFileToVault(file.path, remote, file);
           const refreshed = this.getVaultFileByPath(file.path);
           this.syncIndex.set(file.path, {
-            localSignature: refreshed ? this.buildSyncSignature(refreshed) : remoteSignature,
+            localSignature: refreshed ? await this.buildCurrentLocalSignature(refreshed) : remoteSignature,
             remoteSignature,
             remotePath,
           });
@@ -1233,7 +1361,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         }
 
         if (localChanged && !remoteChanged) {
-          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+          const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent ?? undefined);
           this.syncIndex.set(file.path, {
             localSignature,
             remoteSignature: uploadedRemote.signature,
@@ -1249,7 +1377,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           await this.downloadRemoteFileToVault(file.path, remote, file);
           const refreshed = this.getVaultFileByPath(file.path);
           this.syncIndex.set(file.path, {
-            localSignature: refreshed ? this.buildSyncSignature(refreshed) : remoteSignature,
+            localSignature: refreshed ? await this.buildCurrentLocalSignature(refreshed) : remoteSignature,
             remoteSignature,
             remotePath,
           });
@@ -1257,7 +1385,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           continue;
         }
 
-        const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+        const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent ?? undefined);
         this.syncIndex.set(file.path, {
           localSignature,
           remoteSignature: uploadedRemote.signature,
@@ -1582,9 +1710,11 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return entries.find((entry) => !entry.isCollection)?.file ?? null;
   }
 
-  private async uploadContentFileToRemote(file: TFile, remotePath: string) {
+  private async uploadContentFileToRemote(file: TFile, remotePath: string, markdownContent?: string) {
+    let binary: ArrayBuffer;
+
     if (file.extension === "md") {
-      const content = await this.app.vault.read(file);
+      const content = markdownContent ?? (await this.readMarkdownContentPreferEditor(file));
       if (this.parseNoteStub(content)) {
         throw new Error(
           this.t(
@@ -1593,9 +1723,12 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           ),
         );
       }
+
+      binary = this.encodeUtf8(content);
+    } else {
+      binary = await this.app.vault.readBinary(file);
     }
 
-    const binary = await this.app.vault.readBinary(file);
     await this.uploadBinary(remotePath, binary, this.getMimeType(file.extension));
     const remote = await this.statRemoteFile(remotePath);
     if (remote) {
@@ -1713,6 +1846,43 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
   private buildSyncSignature(file: TFile) {
     return `${file.stat.mtime}:${file.stat.size}`;
+  }
+
+  private getOpenMarkdownContent(notePath: string) {
+    const leaves = this.app.workspace.getLeavesOfType("markdown");
+    for (const leaf of leaves) {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView)) {
+        continue;
+      }
+
+      if (!view.file || view.file.path !== notePath) {
+        continue;
+      }
+
+      return view.editor.getValue();
+    }
+
+    return null;
+  }
+
+  private async readMarkdownContentPreferEditor(file: TFile) {
+    const liveContent = this.getOpenMarkdownContent(file.path);
+    if (liveContent !== null) {
+      return liveContent;
+    }
+
+    return await this.app.vault.read(file);
+  }
+
+  private async buildCurrentLocalSignature(file: TFile, markdownContent?: string) {
+    if (file.extension !== "md") {
+      return this.buildSyncSignature(file);
+    }
+
+    const content = markdownContent ?? (await this.readMarkdownContentPreferEditor(file));
+    const digest = (await this.computeSha256Hex(this.encodeUtf8(content))).slice(0, 16);
+    return `md:${content.length}:${digest}`;
   }
 
   private buildVaultSyncRemotePath(vaultPath: string) {
@@ -2077,13 +2247,46 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       return;
     }
 
+    const running: Promise<void>[] = [];
     for (const task of [...this.queue]) {
-      if (this.processingTaskIds.has(task.id)) {
-        continue;
-      }
-
-      void this.processTask(task);
+      running.push(this.startPendingTask(task));
     }
+
+    if (running.length > 0) {
+      await Promise.allSettled(running);
+    }
+  }
+
+  private startPendingTask(task: UploadTask) {
+    const existing = this.pendingTaskPromises.get(task.id);
+    if (existing) {
+      return existing;
+    }
+
+    const promise = this.processTask(task).finally(() => {
+      this.pendingTaskPromises.delete(task.id);
+    });
+    this.pendingTaskPromises.set(task.id, promise);
+    return promise;
+  }
+
+  private async preparePendingUploadsForSync(showNotice: boolean) {
+    await this.processPendingTasks();
+
+    if (this.queue.length > 0 || this.processingTaskIds.size > 0 || this.pendingTaskPromises.size > 0) {
+      this.lastVaultSyncAt = Date.now();
+      this.lastVaultSyncStatus = this.t(
+        "检测到图片上传仍在进行或等待重试，已暂缓本次笔记同步，避免旧版笔记覆盖新图片引用。",
+        "Image uploads are still running or waiting for retry, so note sync was deferred to avoid old note content overwriting new image references.",
+      );
+      await this.savePluginState();
+      if (showNotice) {
+        new Notice(this.lastVaultSyncStatus, 8000);
+      }
+      return false;
+    }
+
+    return true;
   }
 
   private async uploadImagesInNote(noteFile: TFile) {
@@ -2107,6 +2310,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
 
       await this.app.vault.modify(noteFile, updated);
+      this.schedulePriorityNoteSync(noteFile.path, "image-add");
 
       if (this.settings.deleteLocalAfterUpload) {
         for (const replacement of replacements) {
@@ -2160,6 +2364,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       this.queue = this.queue.filter((item) => item.id !== task.id);
       await this.savePluginState();
+      this.schedulePriorityNoteSync(task.notePath, "image-add");
       new Notice(this.t("图片上传成功。", "Image uploaded successfully."));
     } catch (error) {
       console.error("Secure WebDAV queued upload failed", error);
@@ -2188,7 +2393,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     const delay = Math.max(1, this.settings.retryDelaySeconds) * 1000 * task.attempts;
     const timeoutId = window.setTimeout(() => {
       this.retryTimeouts.delete(task.id);
-      void this.processTask(task);
+      void this.startPendingTask(task);
     }, delay);
     this.retryTimeouts.set(task.id, timeoutId);
   }
