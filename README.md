@@ -79,6 +79,29 @@ Normal note deletion is no longer inferred only from timestamps.
 
 The plugin writes an explicit remote deletion tombstone and prefers that tombstone during reconciliation. A local note is deleted only when the tombstone is authoritative and the local copy has not changed since the last successful sync.
 
+## Upgrade Notes For 0.0.10
+
+Version `0.0.10` fixes a rename-sync race that could restore the old note path after you changed a note title.
+
+What happened before:
+
+- a local note was renamed
+- the plugin still needed a short moment to write the deletion tombstone for the old path
+- sync could start before that rename handling fully settled
+- the old remote file could then be treated as a remote file to restore
+- the vault ended up with both the new title and the old title
+
+What `0.0.10` changes:
+
+- sync now waits for pending vault rename/delete/modify handling before reconciliation begins
+- rename tombstones get a chance to land before the old remote path is considered for restoration
+- prioritized note sync also avoids running while vault mutation handling is still in flight
+
+Why this version matters:
+
+- if you saw duplicate notes after renaming a title, this is the version that fixes that race directly
+- if you sync frequently across desktop and mobile, this upgrade is strongly recommended
+
 ## Upgrade Notes For 0.0.9
 
 Version `0.0.9` fixes a high-risk race around pasted images and note sync.
