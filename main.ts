@@ -116,6 +116,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   private syncIndex = new Map<string, SyncIndexEntry>();
   private missingLazyRemoteNotes = new Map<string, MissingLazyRemoteRecord>();
   private pendingTaskPromises = new Map<string, Promise<void>>();
+  private pendingVaultMutationPromises = new Set<Promise<void>>();
   private priorityNoteSyncTimeouts = new Map<string, number>();
   private priorityNoteSyncsInFlight = new Set<string>();
   private lastVaultSyncAt = 0;
@@ -195,9 +196,11 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     );
 
     await this.rebuildReferenceIndex();
-    this.registerEvent(this.app.vault.on("modify", (file) => void this.handleVaultModify(file)));
-    this.registerEvent(this.app.vault.on("delete", (file) => void this.handleVaultDelete(file)));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => void this.handleVaultRename(file, oldPath)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.trackVaultMutation(() => this.handleVaultModify(file))));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.trackVaultMutation(() => this.handleVaultDelete(file))));
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => this.trackVaultMutation(() => this.handleVaultRename(file, oldPath))),
+    );
 
     this.setupAutoSync();
 
@@ -465,12 +468,14 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
     if (file.extension === "md") {
       const refs = this.noteRemoteRefs.get(oldPath);
-      if (!refs) {
-        return;
+      if (refs) {
+        this.noteRemoteRefs.delete(oldPath);
+        this.noteRemoteRefs.set(file.path, refs);
       }
 
-      this.noteRemoteRefs.delete(oldPath);
-      this.noteRemoteRefs.set(file.path, refs);
+      if (!this.shouldSkipContentSyncPath(file.path)) {
+        this.schedulePriorityNoteSync(file.path, "image-add");
+      }
     }
   }
 
@@ -524,7 +529,12 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       return;
     }
 
-    if (this.hasPendingImageWorkForNote(notePath) || this.syncInProgress || this.autoSyncTickInProgress) {
+    if (
+      this.hasPendingImageWorkForNote(notePath) ||
+      this.pendingVaultMutationPromises.size > 0 ||
+      this.syncInProgress ||
+      this.autoSyncTickInProgress
+    ) {
       this.schedulePriorityNoteSync(notePath, reason);
       return;
     }
@@ -1119,6 +1129,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.syncInProgress = true;
     try {
       this.ensureConfigured();
+      await this.waitForPendingVaultMutations();
       const uploadsReady = await this.preparePendingUploadsForSync(showNotice);
       if (!uploadsReady) {
         return;
@@ -2254,6 +2265,23 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
     if (running.length > 0) {
       await Promise.allSettled(running);
+    }
+  }
+
+  private trackVaultMutation(operation: () => Promise<void>) {
+    const promise = operation()
+      .catch((error) => {
+        console.error("Secure WebDAV vault mutation handling failed", error);
+      })
+      .finally(() => {
+        this.pendingVaultMutationPromises.delete(promise);
+      });
+    this.pendingVaultMutationPromises.add(promise);
+  }
+
+  private async waitForPendingVaultMutations() {
+    while (this.pendingVaultMutationPromises.size > 0) {
+      await Promise.allSettled([...this.pendingVaultMutationPromises]);
     }
   }
 
