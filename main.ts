@@ -2584,6 +2584,24 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async processSecureImages(el: HTMLElement, ctx: MarkdownPostProcessorContext) {
+    const secureCodeBlocks = Array.from(el.querySelectorAll<HTMLElement>("pre > code.language-secure-webdav"));
+    await Promise.all(
+      secureCodeBlocks.map(async (codeEl) => {
+        const pre = codeEl.parentElement;
+        if (!(pre instanceof HTMLElement) || pre.hasAttribute("data-secure-webdav-rendered")) {
+          return;
+        }
+
+        const parsed = this.parseSecureImageBlock(codeEl.textContent ?? "");
+        if (!parsed?.path) {
+          return;
+        }
+
+        pre.setAttribute("data-secure-webdav-rendered", "true");
+        await this.renderSecureImageIntoElement(pre, parsed.path, parsed.alt || parsed.path);
+      }),
+    );
+
     const secureNodes = Array.from(el.querySelectorAll<HTMLElement>("[data-secure-webdav]"));
     await Promise.all(
       secureNodes.map(async (node) => {
@@ -2621,14 +2639,18 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       return;
     }
 
+    await this.renderSecureImageIntoElement(el, parsed.path, parsed.alt || parsed.path);
+    ctx.addChild(new SecureWebdavRenderChild(el));
+  }
+
+  private async renderSecureImageIntoElement(el: HTMLElement, remotePath: string, alt: string) {
     const img = document.createElement("img");
-    img.alt = parsed.alt || parsed.path;
-    img.setAttribute("data-secure-webdav", parsed.path);
+    img.alt = alt;
+    img.setAttribute("data-secure-webdav", remotePath);
     img.classList.add("secure-webdav-image", "is-loading");
     el.empty();
     el.appendChild(img);
     await this.swapImageSource(img);
-    ctx.addChild(new SecureWebdavRenderChild(el));
   }
 
   private parseSecureImageBlock(source: string) {
