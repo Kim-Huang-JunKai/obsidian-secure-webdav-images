@@ -3123,6 +3123,19 @@ class SecureWebdavSettingTab extends PluginSettingTab {
       ),
     });
 
+    new Setting(containerEl)
+      .setName(this.plugin.t("当前插件版本", "Current plugin version"))
+      .setDesc(
+        this.plugin.t(
+          "多端使用时可先核对这里的版本号，避免因为客户端升级不到位导致行为不一致。",
+          "Check this version first across devices to avoid inconsistent behavior caused by incomplete upgrades.",
+        ),
+      )
+      .addText((text) => {
+        text.setValue(this.plugin.manifest.version);
+        text.setDisabled(true);
+      });
+
     containerEl.createEl("h3", { text: this.plugin.t("界面语言", "Interface language") });
 
     new Setting(containerEl)
