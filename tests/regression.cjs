@@ -1,0 +1,487 @@
+const assert = require("assert");
+const Module = require("module");
+const { createMockObsidianModule, createMockApp, createMarkdownLeaf, Editor, Notice } = require("./support/mock-obsidian.cjs");
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+
+  return { promise, resolve, reject };
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function loadPluginClass(requestUrlHandler) {
+  const mockObsidian = createMockObsidianModule(requestUrlHandler);
+  const originalLoad = Module._load;
+
+  Object.assign(global, {
+    App: mockObsidian.App,
+    Editor: mockObsidian.Editor,
+    MarkdownFileInfo: mockObsidian.MarkdownFileInfo,
+    MarkdownRenderChild: mockObsidian.MarkdownRenderChild,
+    MarkdownView: mockObsidian.MarkdownView,
+    MarkdownPostProcessorContext: mockObsidian.MarkdownPostProcessorContext,
+    Modal: mockObsidian.Modal,
+    Notice: mockObsidian.Notice,
+    Plugin: mockObsidian.Plugin,
+    PluginSettingTab: mockObsidian.PluginSettingTab,
+    Setting: mockObsidian.Setting,
+    TAbstractFile: mockObsidian.TAbstractFile,
+    TFile: mockObsidian.TFile,
+    window: {
+      setTimeout,
+      clearTimeout,
+      setInterval,
+      clearInterval,
+    },
+  });
+
+  Module._load = function patchedLoad(request, parent, isMain) {
+    if (request === "obsidian") {
+      return mockObsidian;
+    }
+
+    return originalLoad.call(this, request, parent, isMain);
+  };
+
+  try {
+    const mainPath = require.resolve("../main.js");
+    delete require.cache[mainPath];
+    const pluginModule = require(mainPath);
+    return pluginModule.default;
+  } finally {
+    Module._load = originalLoad;
+  }
+}
+
+function createHarness(requestUrlHandler) {
+  const PluginClass = loadPluginClass(requestUrlHandler);
+  const plugin = new PluginClass();
+  const app = createMockApp();
+  plugin.app = app;
+  plugin.savePluginState = async () => {};
+  plugin.loadPluginState = async () => {};
+  plugin.settings = {
+    ...plugin.settings,
+    webdavUrl: "http://mock-webdav",
+    username: "user",
+    password: "pass",
+    remoteFolder: "/remote-images/",
+    vaultSyncRemoteFolder: "/vault-sync/",
+    compressImages: false,
+    autoSyncIntervalMinutes: 0,
+  };
+  plugin.normalizeEffectiveSettings();
+  plugin.initializeSupportModules();
+  plugin.schedulePriorityNoteSync = () => {};
+  plugin.uploadQueue.deps.schedulePriorityNoteSync = () => {};
+  return { plugin, app };
+}
+
+function installMarkdownLeaf(app, file, editor) {
+  app.workspace.leaves = [createMarkdownLeaf(file, editor)];
+  app.workspace.activeFile = file;
+}
+
+function createRemoteFileState(remotePath, body, lastModified = Date.now()) {
+  const binary = body instanceof ArrayBuffer ? body.slice(0) : new TextEncoder().encode(String(body)).buffer;
+  return {
+    remotePath,
+    lastModified,
+    size: binary.byteLength,
+    signature: `${lastModified}:${binary.byteLength}`,
+    body: binary,
+  };
+}
+
+async function testPlaceholderReplacement() {
+  const calls = [];
+  const { plugin, app } = createHarness(async (options) => {
+    calls.push(options);
+    return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+
+  const file = app.vault.addFile("Notes/test.md", "before", { mtime: 1000 });
+  const editor = new Editor("intro\n");
+  const task = plugin.createUploadTask(file.path, new TextEncoder().encode("image-bytes").buffer, "image/png", "sample.png");
+  editor.setValue(`intro\n${task.placeholder}\nend\n`);
+  installMarkdownLeaf(app, file, editor);
+  plugin.queue = [task];
+
+  await plugin.processTask(task);
+
+  assert.equal(calls.length, 1, "upload should call PUT once");
+  assert.equal(calls[0].method, "PUT", "upload should use PUT");
+  const content = editor.getValue();
+  assert.ok(!content.includes(task.placeholder), "placeholder should be replaced");
+  assert.ok(content.includes("```secure-webdav"), "replacement should use secure-webdav code block");
+  assert.ok(content.includes("path:"), "code block should contain path");
+  assert.ok(content.includes("alt:"), "code block should contain alt");
+  assert.equal(plugin.queue.length, 0, "queue item should be removed after success");
+}
+
+async function testImageSupportBlockRoundTrip() {
+  const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+  const markup = plugin.imageSupport.buildSecureImageMarkup("webdav-secure://remote-images/example.webp", "Example image");
+
+  assert.ok(markup.includes("```secure-webdav"), "secure image markup should use the custom code block");
+  assert.ok(markup.includes("path: remote-images/example.webp"), "secure image markup should keep the remote path");
+  assert.ok(markup.includes("alt: Example image"), "secure image markup should keep alt text");
+
+  const parsed = plugin.imageSupport.parseSecureImageBlock("path: remote-images/example.webp\nalt: Example image");
+  assert.deepEqual(parsed, { path: "remote-images/example.webp", alt: "Example image" });
+
+  const passthrough = plugin.imageSupport.buildSecureImageMarkup("https://example.com/image.png", "External");
+  assert.equal(passthrough, "![](https://example.com/image.png)", "non secure URLs should pass through");
+}
+
+async function testSyncWaitsForImageQueue() {
+  const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+  const gate = deferred();
+  let started = false;
+  const task = plugin.createUploadTask(
+    "Notes/pending.md",
+    new TextEncoder().encode("pending").buffer,
+    "image/png",
+    "pending.png",
+  );
+  plugin.queue = [task];
+  plugin.uploadQueue.processTask = async () => {
+    started = true;
+    await gate.promise;
+  };
+
+  const syncPromise = plugin.syncConfiguredVaultContent(false);
+  await delay(20);
+  assert.ok(started, "sync should start pending upload before proceeding");
+
+  let settled = false;
+  syncPromise.then(() => {
+    settled = true;
+  });
+  await delay(40);
+  assert.equal(settled, false, "sync should wait for the image queue to settle");
+
+  gate.resolve();
+  await syncPromise;
+  assert.ok(plugin.lastVaultSyncStatus.length > 0, "sync should leave a status message after deferring note sync");
+}
+
+async function testQueueDedupesActiveTask() {
+  const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+  const gate = deferred();
+  let starts = 0;
+  const task = plugin.createUploadTask(
+    "Notes/dedup.md",
+    new TextEncoder().encode("dedupe").buffer,
+    "image/png",
+    "dedupe.png",
+  );
+  plugin.queue = [task];
+  plugin.uploadQueue.processTask = async (incomingTask) => {
+    starts += 1;
+    assert.equal(incomingTask.id, task.id, "the same task should be reused while it is still running");
+    await gate.promise;
+  };
+
+  const firstPass = plugin.processPendingTasks();
+  await delay(20);
+  const secondPass = plugin.processPendingTasks();
+  await delay(20);
+
+  assert.equal(starts, 1, "pending task should only start once even if the queue is processed twice");
+
+  gate.resolve();
+  await Promise.all([firstPass, secondPass]);
+}
+
+async function testPermanentUploadFailureRewritesPlaceholder() {
+  const calls = [];
+  const { plugin, app } = createHarness(async (options) => {
+    calls.push(options);
+    return { status: 500, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+  plugin.settings.maxRetryAttempts = 1;
+
+  const file = app.vault.addFile("Notes/failure.md", "before", { mtime: 1000 });
+  const editor = new Editor("intro\n");
+  const task = plugin.createUploadTask(
+    file.path,
+    new TextEncoder().encode("broken-image").buffer,
+    "image/png",
+    "broken.png",
+  );
+  editor.setValue(`intro\n${task.placeholder}\nend\n`);
+  installMarkdownLeaf(app, file, editor);
+  plugin.queue = [task];
+
+  const originalConsoleError = console.error;
+  console.error = () => {};
+  try {
+    await plugin.processTask(task);
+  } finally {
+    console.error = originalConsoleError;
+  }
+
+  assert.equal(calls.length, 1, "failed upload should still attempt the remote PUT once");
+  assert.ok(!editor.getValue().includes(task.placeholder), "failed placeholder should replace the pending marker");
+  assert.ok(editor.getValue().includes("secure-webdav-failed"), "permanent failure should render the failed placeholder");
+  assert.ok(editor.getValue().includes("broken.png"), "failed placeholder should keep the image name");
+  assert.ok(editor.getValue().includes("500"), "failed placeholder should include the failure reason");
+  assert.equal(plugin.queue.length, 0, "permanent failure should remove the task from the queue");
+}
+
+async function testLazyStubRefusesUpload() {
+  let requestCalls = 0;
+  const { plugin, app } = createHarness(async () => {
+    requestCalls += 1;
+    return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+  const file = app.vault.addFile("Notes/lazy.md", "", { mtime: 1000 });
+  const stub = [
+    "<!-- secure-webdav-note-stub",
+    "remote: vault-sync/Notes/lazy.md",
+    "placeholder: lazy",
+    "-->",
+    "",
+    "This is a local placeholder.",
+  ].join("\n");
+
+  await assert.rejects(
+    () => plugin.uploadContentFileToRemote(file, plugin.buildVaultSyncRemotePath("Notes/lazy.md"), stub),
+    /Refusing to upload a lazy-note placeholder|拒绝把按需加载占位笔记上传为远端正文/,
+  );
+  assert.equal(requestCalls, 0, "lazy placeholder should never reach remote upload");
+}
+
+async function testRenameDoesNotRestoreOldPath() {
+  const remoteStore = new Map();
+  const { plugin, app } = createHarness(async (options) => {
+    const { url, method, body } = options;
+
+    if (method === "PUT") {
+      remoteStore.set(url, { body: body ? body.slice(0) : new ArrayBuffer(0) });
+      return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+    }
+
+    if (method === "DELETE") {
+      remoteStore.delete(url);
+      return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+    }
+
+    if (method === "GET") {
+      const record = remoteStore.get(url);
+      if (!record) {
+        return { status: 404, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+      }
+
+      return { status: 200, headers: {}, arrayBuffer: record.body };
+    }
+
+    return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+
+  const oldPath = "Notes/old-title.md";
+  const newPath = "Notes/new-title.md";
+  const newFile = app.vault.addFile(newPath, "fresh content", { mtime: 2000 });
+  const oldRemotePath = plugin.buildVaultSyncRemotePath(oldPath);
+  const newRemotePath = plugin.buildVaultSyncRemotePath(newPath);
+  const newLocalSignature = await plugin.buildCurrentLocalSignature(newFile, "fresh content");
+
+  plugin.syncIndex.set(oldPath, {
+    localSignature: "md:old",
+    remoteSignature: "sig-old",
+    remotePath: oldRemotePath,
+  });
+  plugin.uploadQueue.deps.schedulePriorityNoteSync = () => {};
+
+  await plugin.handleVaultRename(newFile, oldPath);
+  const tombstonePath = plugin.buildDeletionRemotePath(oldPath);
+  const tombstoneUrl = plugin.buildUploadUrl(tombstonePath);
+  assert.ok(remoteStore.has(tombstoneUrl), "rename should write a remote tombstone");
+
+  plugin.readDeletionTombstones = async () =>
+    new Map([
+      [
+        oldPath,
+        {
+          path: oldPath,
+          deletedAt: Date.now(),
+          remoteSignature: "sig-old",
+        },
+      ],
+    ]);
+  plugin.listRemoteTree = async () => ({
+    files: new Map([
+      [oldRemotePath, { remotePath: oldRemotePath, lastModified: 1000, size: 16, signature: "sig-old" }],
+      [newRemotePath, { remotePath: newRemotePath, lastModified: 2000, size: 13, signature: newLocalSignature }],
+    ]),
+    directories: new Set([plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder)]),
+  });
+
+  const downloadedPaths = [];
+  const originalDownload = plugin.downloadRemoteFileToVault.bind(plugin);
+  plugin.downloadRemoteFileToVault = async (vaultPath, remote, existingFile) => {
+    downloadedPaths.push(vaultPath);
+    if (vaultPath === oldPath) {
+      throw new Error("old path should not be restored");
+    }
+
+    return originalDownload(vaultPath, remote, existingFile);
+  };
+
+  const deletedRemotePaths = [];
+  const originalDeleteRemote = plugin.deleteRemoteContentFile.bind(plugin);
+  plugin.deleteRemoteContentFile = async (remotePath) => {
+    deletedRemotePaths.push(remotePath);
+    return originalDeleteRemote(remotePath);
+  };
+
+  await plugin.syncConfiguredVaultContent(false);
+
+  assert.ok(deletedRemotePaths.includes(oldRemotePath), "sync should delete the old remote path");
+  assert.ok(!downloadedPaths.includes(oldPath), "old renamed path should not return locally");
+  assert.equal(app.vault.getAbstractFileByPath(oldPath), null, "old renamed path should stay absent locally");
+  assert.ok(app.vault.getAbstractFileByPath(newPath), "new renamed path should remain locally");
+  assert.ok(remoteStore.has(tombstoneUrl), "tombstone should remain stored in the mock remote");
+}
+
+async function testDeletionTombstoneDeletesStaleCopy() {
+  const deletedPaths = [];
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  const file = app.vault.addFile("Notes/stale.md", "stale body", { mtime: 1000 });
+  const remotePath = plugin.buildVaultSyncRemotePath(file.path);
+  const remoteState = createRemoteFileState(remotePath, "stale body", 1500);
+  const tombstone = {
+    path: file.path,
+    deletedAt: 2500,
+    remoteSignature: remoteState.signature,
+  };
+
+  plugin.listRemoteTree = async () => ({
+    files: new Map([[remotePath, remoteState]]),
+    directories: new Set([plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder)]),
+  });
+  plugin.readDeletionTombstones = async () => new Map([[file.path, tombstone]]);
+  plugin.deleteRemoteContentFile = async (remotePathToDelete) => {
+    deletedPaths.push(remotePathToDelete);
+  };
+  plugin.deleteExtraRemoteDirectories = async () => 0;
+  plugin.reconcileRemoteImages = async () => ({ deletedFiles: 0, deletedDirectories: 0 });
+  plugin.evictStaleSyncedNotes = async () => 0;
+  plugin.syncIndex.set(file.path, {
+    localSignature: await plugin.buildCurrentLocalSignature(file, "stale body"),
+    remoteSignature: remoteState.signature,
+    remotePath,
+  });
+
+  await plugin.syncConfiguredVaultContent(false);
+
+  assert.equal(app.vault.getAbstractFileByPath(file.path), null, "stale local copy should be removed");
+  assert.ok(deletedPaths.includes(remotePath), "matching remote content should be deleted");
+  assert.ok(
+    !deletedPaths.includes(plugin.buildDeletionRemotePath(file.path)),
+    "authoritative tombstone should stay in place after it deletes the stale copy",
+  );
+  assert.equal(plugin.syncIndex.has(file.path), false, "sync index should drop the deleted note");
+}
+
+async function testFreshLocalEditWinsOverTombstone() {
+  const deletedPaths = [];
+  const uploadedPaths = [];
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  const file = app.vault.addFile("Notes/keep.md", "fresh local edit", { mtime: 9000 });
+  const remotePath = plugin.buildVaultSyncRemotePath(file.path);
+  const remoteState = createRemoteFileState(remotePath, "original remote body", 1500);
+  const tombstone = {
+    path: file.path,
+    deletedAt: 2000,
+    remoteSignature: remoteState.signature,
+  };
+
+  plugin.listRemoteTree = async () => ({
+    files: new Map([[remotePath, remoteState]]),
+    directories: new Set([plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder)]),
+  });
+  plugin.readDeletionTombstones = async () => new Map([[file.path, tombstone]]);
+  plugin.uploadContentFileToRemote = async (incomingFile, incomingRemotePath, markdownContent) => {
+    uploadedPaths.push(incomingRemotePath);
+    const content = markdownContent ?? (await plugin.readMarkdownContentPreferEditor(incomingFile));
+    const nextRemote = createRemoteFileState(incomingRemotePath, content, incomingFile.stat.mtime);
+    remoteState.body = nextRemote.body;
+    remoteState.lastModified = nextRemote.lastModified;
+    remoteState.size = nextRemote.size;
+    remoteState.signature = nextRemote.signature;
+    return nextRemote;
+  };
+  plugin.deleteRemoteContentFile = async (remotePathToDelete) => {
+    deletedPaths.push(remotePathToDelete);
+  };
+  plugin.deleteExtraRemoteDirectories = async () => 0;
+  plugin.reconcileRemoteImages = async () => ({ deletedFiles: 0, deletedDirectories: 0 });
+  plugin.evictStaleSyncedNotes = async () => 0;
+  plugin.syncIndex.set(file.path, {
+    localSignature: await plugin.buildCurrentLocalSignature(file, "original remote body"),
+    remoteSignature: remoteState.signature,
+    remotePath,
+  });
+
+  await plugin.syncConfiguredVaultContent(false);
+
+  assert.ok(app.vault.getAbstractFileByPath(file.path), "newer local edit should be preserved");
+  assert.ok(deletedPaths.length >= 1, "the tombstone should be cleaned up");
+  assert.ok(
+    deletedPaths.every((path) => path === plugin.buildDeletionRemotePath(file.path)),
+    "only the tombstone should be cleaned up",
+  );
+  assert.deepEqual(uploadedPaths, [remotePath], "fresh local content should be re-uploaded instead of deleted");
+  assert.equal(plugin.syncIndex.get(file.path)?.remotePath, remotePath, "sync index should keep the note mapped to the same remote path");
+}
+
+async function run() {
+  const tests = [
+    ["图片上传后占位替换", testPlaceholderReplacement],
+    ["图片模块代码块生成与解析", testImageSupportBlockRoundTrip],
+    ["同步等待图片队列", testSyncWaitsForImageQueue],
+    ["队列不会重复启动同一任务", testQueueDedupesActiveTask],
+    ["上传永久失败会清空队列并替换失败占位", testPermanentUploadFailureRewritesPlaceholder],
+    ["懒加载占位不会上传成正文", testLazyStubRefusesUpload],
+    ["重命名不会恢复旧路径", testRenameDoesNotRestoreOldPath],
+    ["墓碑会删除过时本地副本", testDeletionTombstoneDeletesStaleCopy],
+    ["本地新修改会覆盖墓碑而不是被误删", testFreshLocalEditWinsOverTombstone],
+  ];
+
+  const failures = [];
+  for (const [name, testFn] of tests) {
+    try {
+      Notice.messages.length = 0;
+      await testFn();
+      console.log(`PASS ${name}`);
+    } catch (error) {
+      failures.push({ name, error });
+      console.error(`FAIL ${name}`);
+      console.error(error);
+    }
+  }
+
+  if (failures.length > 0) {
+    process.exitCode = 1;
+    console.error(`\n${failures.length} test(s) failed.`);
+  } else {
+    console.log("\nAll regression tests passed.");
+  }
+}
+
+run().catch((error) => {
+  console.error(error);
+  process.exit(1);
+});

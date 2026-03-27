@@ -2,9 +2,7 @@
   App,
   Editor,
   MarkdownFileInfo,
-  MarkdownRenderChild,
   MarkdownView,
-  MarkdownPostProcessorContext,
   Modal,
   Notice,
   Plugin,
@@ -15,6 +13,12 @@
   normalizePath,
   requestUrl as obsidianRequestUrl,
 } from "obsidian";
+import { SECURE_CODE_BLOCK, SECURE_PROTOCOL, SecureWebdavImageSupport } from "./secure-webdav-image-support";
+import { SecureWebdavUploadQueueSupport, type UploadTask } from "./secure-webdav-upload-queue";
+import {
+  SecureWebdavSyncSupport,
+  type DeletionTombstone,
+} from "./secure-webdav-sync-support";
 
 type SecureWebdavSettings = {
   webdavUrl: string;
@@ -37,18 +41,6 @@ type SecureWebdavSettings = {
   jpegQuality: number;
 };
 
-type UploadTask = {
-  id: string;
-  notePath: string;
-  placeholder: string;
-  mimeType: string;
-  fileName: string;
-  dataBase64: string;
-  attempts: number;
-  createdAt: number;
-  lastError?: string;
-};
-
 type SyncIndexEntry = {
   localSignature: string;
   remoteSignature: string;
@@ -60,12 +52,6 @@ type RemoteFileState = {
   lastModified: number;
   size: number;
   signature: string;
-};
-
-type DeletionTombstone = {
-  path: string;
-  deletedAt: number;
-  remoteSignature?: string;
 };
 
 type MissingLazyRemoteRecord = {
@@ -100,22 +86,17 @@ const DEFAULT_SETTINGS: SecureWebdavSettings = {
   jpegQuality: 82,
 };
 
-const SECURE_PROTOCOL = "webdav-secure:";
-const SECURE_CODE_BLOCK = "secure-webdav";
 const SECURE_NOTE_STUB = "secure-webdav-note-stub";
 
 export default class SecureWebdavImagesPlugin extends Plugin {
   settings: SecureWebdavSettings = DEFAULT_SETTINGS;
   queue: UploadTask[] = [];
   private blobUrls = new Set<string>();
-  private processingTaskIds = new Set<string>();
-  private retryTimeouts = new Map<string, number>();
   private noteRemoteRefs = new Map<string, Set<string>>();
   private remoteCleanupInFlight = new Set<string>();
   private noteAccessTimestamps = new Map<string, number>();
   private syncIndex = new Map<string, SyncIndexEntry>();
   private missingLazyRemoteNotes = new Map<string, MissingLazyRemoteRecord>();
-  private pendingTaskPromises = new Map<string, Promise<void>>();
   private pendingVaultMutationPromises = new Set<Promise<void>>();
   private priorityNoteSyncTimeouts = new Map<string, number>();
   private priorityNoteSyncsInFlight = new Set<string>();
@@ -123,12 +104,72 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   private lastVaultSyncStatus = "";
   private syncInProgress = false;
   private autoSyncTickInProgress = false;
+  // Image parsing and rendering live in a dedicated helper so sync changes
+  // do not accidentally break display behaviour again.
+  private imageSupport!: SecureWebdavImageSupport;
+  // Upload queue state is isolated so retries and placeholder replacement do
+  // not keep sprawling across the main plugin class.
+  private uploadQueue!: SecureWebdavUploadQueueSupport;
+  // Sync metadata helpers are isolated so reconciliation rules stay explicit.
+  private syncSupport!: SecureWebdavSyncSupport;
 
   private readonly deletionFolderSuffix = ".__secure-webdav-deletions__/";
   private readonly missingLazyRemoteConfirmations = 2;
 
+  private initializeSupportModules() {
+    // Keep runtime-only integration here: the image module owns parsing and
+    // rendering, while the plugin still owns WebDAV access and lifecycle.
+    this.imageSupport = new SecureWebdavImageSupport({
+      t: this.t.bind(this),
+      fetchSecureImageBlobUrl: this.fetchSecureImageBlobUrl.bind(this),
+    });
+    this.uploadQueue = new SecureWebdavUploadQueueSupport({
+      app: this.app,
+      t: this.t.bind(this),
+      settings: () => this.settings,
+      getQueue: () => this.queue,
+      setQueue: (queue) => {
+        this.queue = queue;
+      },
+      savePluginState: this.savePluginState.bind(this),
+      schedulePriorityNoteSync: this.schedulePriorityNoteSync.bind(this),
+      requestUrl: this.requestUrl.bind(this),
+      buildUploadUrl: this.buildUploadUrl.bind(this),
+      buildAuthHeader: this.buildAuthHeader.bind(this),
+      prepareUploadPayload: this.prepareUploadPayload.bind(this),
+      buildRemoteFileNameFromBinary: this.buildRemoteFileNameFromBinary.bind(this),
+      buildRemotePath: this.buildRemotePath.bind(this),
+      buildSecureImageMarkup: this.imageSupport.buildSecureImageMarkup.bind(this.imageSupport),
+      getMimeTypeFromFileName: this.getMimeTypeFromFileName.bind(this),
+      arrayBufferToBase64: this.arrayBufferToBase64.bind(this),
+      base64ToArrayBuffer: this.base64ToArrayBuffer.bind(this),
+      escapeHtml: this.escapeHtml.bind(this),
+      escapeRegExp: this.escapeRegExp.bind(this),
+      describeError: this.describeError.bind(this),
+    });
+    this.syncSupport = new SecureWebdavSyncSupport({
+      app: this.app,
+      getVaultSyncRemoteFolder: () => this.settings.vaultSyncRemoteFolder,
+      deletionFolderSuffix: this.deletionFolderSuffix,
+      encodeBase64Url: (value) =>
+        this.arrayBufferToBase64(this.encodeUtf8(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""),
+      decodeBase64Url: (value) => {
+        const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+        const padded = normalized + "=".repeat((4 - (normalized.length % 4 || 4)) % 4);
+        return this.decodeUtf8(this.base64ToArrayBuffer(padded));
+      },
+    });
+  }
+
+  private ensureSupportModules() {
+    if (!this.imageSupport || !this.uploadQueue || !this.syncSupport) {
+      this.initializeSupportModules();
+    }
+  }
+
   async onload() {
     await this.loadPluginState();
+    this.initializeSupportModules();
 
     this.addSettingTab(new SecureWebdavSettingTab(this.app, this));
 
@@ -171,10 +212,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     ribbon.addClass("secure-webdav-sync-ribbon");
 
     this.registerMarkdownPostProcessor((el, ctx) => {
-      void this.processSecureImages(el, ctx);
+      void this.imageSupport.processSecureImages(el, ctx);
     });
     this.registerMarkdownCodeBlockProcessor(SECURE_CODE_BLOCK, (source, el, ctx) => {
-      void this.processSecureCodeBlock(source, el, ctx);
+      void this.imageSupport.processSecureCodeBlock(source, el, ctx);
     });
 
     this.registerEvent(
@@ -215,10 +256,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         window.clearTimeout(timeoutId);
       }
       this.priorityNoteSyncTimeouts.clear();
-      for (const timeoutId of this.retryTimeouts.values()) {
-        window.clearTimeout(timeoutId);
-      }
-      this.retryTimeouts.clear();
+      this.uploadQueue.dispose();
     });
   }
 
@@ -227,10 +265,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       URL.revokeObjectURL(blobUrl);
     }
     this.blobUrls.clear();
-    for (const timeoutId of this.retryTimeouts.values()) {
-      window.clearTimeout(timeoutId);
-    }
-    this.retryTimeouts.clear();
+    this.uploadQueue?.dispose();
     for (const timeoutId of this.priorityNoteSyncTimeouts.values()) {
       window.clearTimeout(timeoutId);
     }
@@ -495,7 +530,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     while ((match = codeBlockRegex.exec(content)) !== null) {
-      const parsed = this.parseSecureImageBlock(match[1]);
+      const parsed = this.imageSupport.parseSecureImageBlock(match[1]);
       if (parsed?.path) {
         refs.add(parsed.path);
       }
@@ -589,25 +624,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private hasPendingImageWorkForNote(notePath: string) {
-    if (this.queue.some((task) => task.notePath === notePath)) {
-      return true;
-    }
-
-    for (const taskId of this.processingTaskIds) {
-      const task = this.queue.find((item) => item.id === taskId);
-      if (task?.notePath === notePath) {
-        return true;
-      }
-    }
-
-    for (const [taskId] of this.pendingTaskPromises) {
-      const task = this.queue.find((item) => item.id === taskId);
-      if (task?.notePath === notePath) {
-        return true;
-      }
-    }
-
-    return false;
+    this.ensureSupportModules();
+    return this.uploadQueue.hasPendingWorkForNote(notePath);
   }
 
   private async buildUploadReplacements(content: string, noteFile: TFile, uploadCache?: Map<string, string>) {
@@ -627,7 +645,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         const remoteUrl = await this.uploadVaultFile(file, uploadCache);
         seen.set(match[0], {
           original: match[0],
-          rewritten: this.buildSecureImageMarkup(remoteUrl, file.basename),
+          rewritten: this.imageSupport.buildSecureImageMarkup(remoteUrl, file.basename),
           sourceFile: file,
         });
       }
@@ -645,7 +663,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           const altText = this.extractMarkdownAltText(match[0]) || this.getDisplayNameFromUrl(rawLink);
           seen.set(match[0], {
             original: match[0],
-            rewritten: this.buildSecureImageMarkup(remoteUrl, altText),
+            rewritten: this.imageSupport.buildSecureImageMarkup(remoteUrl, altText),
           });
         }
         continue;
@@ -660,7 +678,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         const remoteUrl = await this.uploadVaultFile(file, uploadCache);
         seen.set(match[0], {
           original: match[0],
-          rewritten: this.buildSecureImageMarkup(remoteUrl, file.basename),
+          rewritten: this.imageSupport.buildSecureImageMarkup(remoteUrl, file.basename),
           sourceFile: file,
         });
       }
@@ -676,7 +694,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       const altText = this.extractHtmlImageAltText(match[0]) || this.getDisplayNameFromUrl(rawLink);
       seen.set(match[0], {
         original: match[0],
-        rewritten: this.buildSecureImageMarkup(remoteUrl, altText),
+        rewritten: this.imageSupport.buildSecureImageMarkup(remoteUrl, altText),
       });
     }
 
@@ -963,7 +981,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       const alt = (node.getAttribute("alt") ?? "").trim() || this.getDisplayNameFromUrl(src);
       const remoteUrl = await this.uploadRemoteImageUrl(src, uploadCache);
-      return this.buildSecureImageMarkup(remoteUrl, alt);
+      return this.imageSupport.buildSecureImageMarkup(remoteUrl, alt);
     }
 
     if (tag === "br") {
@@ -1076,46 +1094,18 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async enqueueEditorImageUpload(noteFile: TFile, editor: Editor, imageFile: File, fileName: string) {
-    try {
-      const arrayBuffer = await imageFile.arrayBuffer();
-      const task = this.createUploadTask(
-        noteFile.path,
-        arrayBuffer,
-        imageFile.type || this.getMimeTypeFromFileName(fileName),
-        fileName,
-      );
-      this.insertPlaceholder(editor, task.placeholder);
-      this.queue.push(task);
-      await this.savePluginState();
-      void this.processPendingTasks();
-      new Notice(this.t("已加入图片自动上传队列。", "Image added to the auto-upload queue."));
-    } catch (error) {
-      console.error("Failed to queue secure image upload", error);
-      new Notice(this.describeError(this.t("加入图片自动上传队列失败", "Failed to queue image for auto-upload"), error), 8000);
-    }
+    this.ensureSupportModules();
+    await this.uploadQueue.enqueueEditorImageUpload(noteFile, editor, imageFile, fileName);
   }
 
   private createUploadTask(notePath: string, binary: ArrayBuffer, mimeType: string, fileName: string): UploadTask {
-    const id = `secure-webdav-task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    return {
-      id,
-      notePath,
-      placeholder: this.buildPendingPlaceholder(id, fileName),
-      mimeType,
-      fileName,
-      dataBase64: this.arrayBufferToBase64(binary),
-      attempts: 0,
-      createdAt: Date.now(),
-    };
+    this.ensureSupportModules();
+    return this.uploadQueue.createUploadTask(notePath, binary, mimeType, fileName);
   }
 
   private buildPendingPlaceholder(taskId: string, fileName: string) {
-    const safeName = this.escapeHtml(fileName);
-    return `<span class="secure-webdav-pending" data-secure-webdav-task="${taskId}" aria-label="${safeName}">${this.escapeHtml(this.t(`【图片上传中｜${fileName}】`, `[Uploading image | ${fileName}]`))}</span>`;
-  }
-
-  private insertPlaceholder(editor: Editor, placeholder: string) {
-    editor.replaceSelection(`${placeholder}\n`);
+    this.ensureSupportModules();
+    return this.uploadQueue.buildPendingPlaceholder(taskId, fileName);
   }
 
   async syncConfiguredVaultContent(showNotice = true) {
@@ -1456,19 +1446,18 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private buildRemoteSyncSignature(remote: Pick<RemoteFileState, "lastModified" | "size">) {
-    return `${remote.lastModified}:${remote.size}`;
+    this.ensureSupportModules();
+    return this.syncSupport.buildRemoteSyncSignature(remote);
   }
 
   private buildDeletionFolder() {
-    return `${this.normalizeFolder(this.settings.vaultSyncRemoteFolder).replace(/\/$/, "")}${this.deletionFolderSuffix}`;
+    this.ensureSupportModules();
+    return this.syncSupport.buildDeletionFolder();
   }
 
   private buildDeletionRemotePath(vaultPath: string) {
-    const encoded = this.arrayBufferToBase64(this.encodeUtf8(vaultPath))
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/g, "");
-    return `${this.buildDeletionFolder()}${encoded}.json`;
+    this.ensureSupportModules();
+    return this.syncSupport.buildDeletionRemotePath(vaultPath);
   }
 
   private parseDeletionTombstoneBase64(value: string) {
@@ -1478,17 +1467,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private remoteDeletionPathToVaultPath(remotePath: string) {
-    const root = this.buildDeletionFolder();
-    if (!remotePath.startsWith(root) || !remotePath.endsWith(".json")) {
-      return null;
-    }
-
-    const encoded = remotePath.slice(root.length, -".json".length);
-    try {
-      return this.parseDeletionTombstoneBase64(encoded);
-    } catch {
-      return null;
-    }
+    this.ensureSupportModules();
+    return this.syncSupport.remoteDeletionPathToVaultPath(remotePath);
   }
 
   private async writeDeletionTombstone(vaultPath: string, remoteSignature?: string) {
@@ -1533,22 +1513,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private parseDeletionTombstonePayload(raw: string): DeletionTombstone | null {
-    try {
-      const parsed = JSON.parse(raw) as Partial<DeletionTombstone>;
-      if (!parsed || typeof parsed.path !== "string" || typeof parsed.deletedAt !== "number") {
-        return null;
-      }
-      if (parsed.remoteSignature !== undefined && typeof parsed.remoteSignature !== "string") {
-        return null;
-      }
-      return {
-        path: parsed.path,
-        deletedAt: parsed.deletedAt,
-        remoteSignature: parsed.remoteSignature,
-      };
-    } catch {
-      return null;
-    }
+    this.ensureSupportModules();
+    return this.syncSupport.parseDeletionTombstonePayload(raw);
   }
 
   private async readDeletionTombstones() {
@@ -1581,37 +1547,26 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private remotePathToVaultPath(remotePath: string) {
-    const root = this.normalizeFolder(this.settings.vaultSyncRemoteFolder);
-    if (!remotePath.startsWith(root)) {
-      return null;
-    }
-
-    return remotePath.slice(root.length).replace(/^\/+/, "");
+    this.ensureSupportModules();
+    return this.syncSupport.remotePathToVaultPath(remotePath);
   }
 
   private shouldDownloadRemoteVersion(localMtime: number, remoteMtime: number) {
-    return remoteMtime > localMtime + 2000;
+    this.ensureSupportModules();
+    return this.syncSupport.shouldDownloadRemoteVersion(localMtime, remoteMtime);
   }
 
   private isTombstoneAuthoritative(
     tombstone: DeletionTombstone,
     remote?: Pick<RemoteFileState, "lastModified" | "signature"> | null,
   ) {
-    const graceMs = 5000;
-    if (!remote) {
-      return true;
-    }
-
-    if (tombstone.remoteSignature) {
-      return remote.signature === tombstone.remoteSignature;
-    }
-
-    return remote.lastModified <= tombstone.deletedAt + graceMs;
+    this.ensureSupportModules();
+    return this.syncSupport.isTombstoneAuthoritative(tombstone, remote);
   }
 
   private shouldDeleteLocalFromTombstone(file: TFile, tombstone: DeletionTombstone) {
-    const graceMs = 5000;
-    return file.stat.mtime <= tombstone.deletedAt + graceMs;
+    this.ensureSupportModules();
+    return this.syncSupport.shouldDeleteLocalFromTombstone(file, tombstone);
   }
 
   private getVaultFileByPath(path: string) {
@@ -1833,30 +1788,18 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private shouldSkipContentSyncPath(path: string) {
-    const normalizedPath = normalizePath(path);
-    if (normalizedPath === ".obsidian" || normalizedPath.startsWith(".obsidian/")) {
-      return true;
-    }
-
-    if (
-      normalizedPath === ".obsidian/plugins/secure-webdav-images" ||
-      normalizedPath.startsWith(".obsidian/plugins/secure-webdav-images/")
-    ) {
-      return true;
-    }
-
-    return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(normalizedPath);
+    this.ensureSupportModules();
+    return this.syncSupport.shouldSkipContentSyncPath(path);
   }
 
   private collectVaultContentFiles() {
-    return this.app.vault
-      .getFiles()
-      .filter((file) => !this.shouldSkipContentSyncPath(file.path))
-      .sort((a, b) => a.path.localeCompare(b.path));
+    this.ensureSupportModules();
+    return this.syncSupport.collectVaultContentFiles();
   }
 
   private buildSyncSignature(file: TFile) {
-    return `${file.stat.mtime}:${file.stat.size}`;
+    this.ensureSupportModules();
+    return this.syncSupport.buildSyncSignature(file);
   }
 
   private getOpenMarkdownContent(notePath: string) {
@@ -1897,7 +1840,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private buildVaultSyncRemotePath(vaultPath: string) {
-    return `${this.normalizeFolder(this.settings.vaultSyncRemoteFolder)}${vaultPath}`;
+    this.ensureSupportModules();
+    return this.syncSupport.buildVaultSyncRemotePath(vaultPath);
   }
 
   private async reconcileRemoteImages() {
@@ -2254,18 +2198,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async processPendingTasks() {
-    if (this.queue.length === 0) {
-      return;
-    }
-
-    const running: Promise<void>[] = [];
-    for (const task of [...this.queue]) {
-      running.push(this.startPendingTask(task));
-    }
-
-    if (running.length > 0) {
-      await Promise.allSettled(running);
-    }
+    this.ensureSupportModules();
+    await this.uploadQueue.processPendingTasks();
   }
 
   private trackVaultMutation(operation: () => Promise<void>) {
@@ -2286,22 +2220,15 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private startPendingTask(task: UploadTask) {
-    const existing = this.pendingTaskPromises.get(task.id);
-    if (existing) {
-      return existing;
-    }
-
-    const promise = this.processTask(task).finally(() => {
-      this.pendingTaskPromises.delete(task.id);
-    });
-    this.pendingTaskPromises.set(task.id, promise);
-    return promise;
+    this.ensureSupportModules();
+    return this.uploadQueue.startPendingTask(task);
   }
 
   private async preparePendingUploadsForSync(showNotice: boolean) {
+    this.ensureSupportModules();
     await this.processPendingTasks();
 
-    if (this.queue.length > 0 || this.processingTaskIds.size > 0 || this.pendingTaskPromises.size > 0) {
+    if (this.uploadQueue.hasPendingWork()) {
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
         "检测到图片上传仍在进行或等待重试，已暂缓本次笔记同步，避免旧版笔记覆盖新图片引用。",
@@ -2356,112 +2283,13 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async processTask(task: UploadTask) {
-    this.processingTaskIds.add(task.id);
-    try {
-      const binary = this.base64ToArrayBuffer(task.dataBase64);
-      const prepared = await this.prepareUploadPayload(
-        binary,
-        task.mimeType || this.getMimeTypeFromFileName(task.fileName),
-        task.fileName,
-      );
-      const remoteName = await this.buildRemoteFileNameFromBinary(prepared.fileName, prepared.binary);
-      const remotePath = this.buildRemotePath(remoteName);
-      const response = await this.requestUrl({
-        url: this.buildUploadUrl(remotePath),
-        method: "PUT",
-        headers: {
-          Authorization: this.buildAuthHeader(),
-          "Content-Type": prepared.mimeType,
-        },
-        body: prepared.binary,
-      });
-
-      if (response.status < 200 || response.status >= 300) {
-        throw new Error(`Upload failed with status ${response.status}`);
-      }
-
-      const replaced = await this.replacePlaceholder(
-        task.notePath,
-        task.id,
-        task.placeholder,
-        this.buildSecureImageMarkup(`${SECURE_PROTOCOL}//${remotePath}`, prepared.fileName),
-      );
-      if (!replaced) {
-        throw new Error(this.t("上传成功，但没有在笔记中找到可替换的占位符。", "Upload succeeded, but no matching placeholder was found in the note."));
-      }
-
-      this.queue = this.queue.filter((item) => item.id !== task.id);
-      await this.savePluginState();
-      this.schedulePriorityNoteSync(task.notePath, "image-add");
-      new Notice(this.t("图片上传成功。", "Image uploaded successfully."));
-    } catch (error) {
-      console.error("Secure WebDAV queued upload failed", error);
-      task.attempts += 1;
-      task.lastError = error instanceof Error ? error.message : String(error);
-      await this.savePluginState();
-      if (task.attempts >= this.settings.maxRetryAttempts) {
-        await this.replacePlaceholder(task.notePath, task.id, task.placeholder, this.buildFailedPlaceholder(task.fileName, task.lastError));
-        this.queue = this.queue.filter((item) => item.id !== task.id);
-        await this.savePluginState();
-        new Notice(this.describeError(this.t("图片上传最终失败", "Image upload failed permanently"), error), 8000);
-      } else {
-        this.scheduleRetry(task);
-      }
-    } finally {
-      this.processingTaskIds.delete(task.id);
-    }
-  }
-
-  private scheduleRetry(task: UploadTask) {
-    const existing = this.retryTimeouts.get(task.id);
-    if (existing) {
-      window.clearTimeout(existing);
-    }
-
-    const delay = Math.max(1, this.settings.retryDelaySeconds) * 1000 * task.attempts;
-    const timeoutId = window.setTimeout(() => {
-      this.retryTimeouts.delete(task.id);
-      void this.startPendingTask(task);
-    }, delay);
-    this.retryTimeouts.set(task.id, timeoutId);
-  }
-
-  private async replacePlaceholder(notePath: string, taskId: string, placeholder: string, replacement: string) {
-    const replacedInEditor = this.replacePlaceholderInOpenEditors(notePath, taskId, placeholder, replacement);
-    if (replacedInEditor) {
-      return true;
-    }
-
-    const file = this.app.vault.getAbstractFileByPath(notePath);
-    if (!(file instanceof TFile)) {
-      return false;
-    }
-
-    const content = await this.app.vault.read(file);
-    if (content.includes(placeholder)) {
-      const updated = content.replace(placeholder, replacement);
-      if (updated !== content) {
-        await this.app.vault.modify(file, updated);
-        return true;
-      }
-    }
-
-    const pattern = new RegExp(`<span[^>]*data-secure-webdav-task="${this.escapeRegExp(taskId)}"[^>]*>.*?<\/span>`, "s");
-    if (pattern.test(content)) {
-      const updated = content.replace(pattern, replacement);
-      if (updated !== content) {
-        await this.app.vault.modify(file, updated);
-        return true;
-      }
-    }
-
-    return false;
+    this.ensureSupportModules();
+    await this.uploadQueue.processTask(task);
   }
 
   private buildFailedPlaceholder(fileName: string, message?: string) {
-    const safeName = this.escapeHtml(fileName);
-    const safeMessage = this.escapeHtml(message ?? this.t("未知错误", "Unknown error"));
-    return `<span class="secure-webdav-failed" aria-label="${safeName}">${this.escapeHtml(this.formatFailedLabel(fileName))}: ${safeMessage}</span>`;
+    this.ensureSupportModules();
+    return this.uploadQueue.buildFailedPlaceholder(fileName, message);
   }
 
   private escapeHtml(value: string) {
@@ -2544,171 +2372,6 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
   private escapeRegExp(value: string) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
-
-  private replacePlaceholderInOpenEditors(notePath: string, taskId: string, placeholder: string, replacement: string) {
-    let replaced = false;
-    const leaves = this.app.workspace.getLeavesOfType("markdown");
-
-    for (const leaf of leaves) {
-      const view = leaf.view;
-      if (!(view instanceof MarkdownView)) {
-        continue;
-      }
-
-      if (!view.file || view.file.path !== notePath) {
-        continue;
-      }
-
-      const editor = view.editor;
-      const content = editor.getValue();
-      let updated = content;
-
-      if (content.includes(placeholder)) {
-        updated = content.replace(placeholder, replacement);
-      } else {
-        const pattern = new RegExp(
-          `<span[^>]*data-secure-webdav-task="${this.escapeRegExp(taskId)}"[^>]*>.*?<\\/span>`,
-          "s",
-        );
-        updated = content.replace(pattern, replacement);
-      }
-
-      if (updated !== content) {
-        editor.setValue(updated);
-        replaced = true;
-      }
-    }
-
-    return replaced;
-  }
-
-  private async processSecureImages(el: HTMLElement, ctx: MarkdownPostProcessorContext) {
-    const secureCodeBlocks = Array.from(el.querySelectorAll<HTMLElement>("pre > code.language-secure-webdav"));
-    await Promise.all(
-      secureCodeBlocks.map(async (codeEl) => {
-        const pre = codeEl.parentElement;
-        if (!(pre instanceof HTMLElement) || pre.hasAttribute("data-secure-webdav-rendered")) {
-          return;
-        }
-
-        const parsed = this.parseSecureImageBlock(codeEl.textContent ?? "");
-        if (!parsed?.path) {
-          return;
-        }
-
-        pre.setAttribute("data-secure-webdav-rendered", "true");
-        await this.renderSecureImageIntoElement(pre, parsed.path, parsed.alt || parsed.path);
-      }),
-    );
-
-    const secureNodes = Array.from(el.querySelectorAll<HTMLElement>("[data-secure-webdav]"));
-    await Promise.all(
-      secureNodes.map(async (node) => {
-        if (node instanceof HTMLImageElement) {
-          await this.swapImageSource(node);
-          return;
-        }
-
-        const remotePath = node.getAttribute("data-secure-webdav");
-        if (!remotePath) {
-          return;
-        }
-
-        const img = document.createElement("img");
-        img.alt = node.getAttribute("aria-label") ?? node.getAttribute("alt") ?? "Secure WebDAV image";
-        img.setAttribute("data-secure-webdav", remotePath);
-        img.classList.add("secure-webdav-image", "is-loading");
-        node.replaceWith(img);
-        await this.swapImageSource(img);
-      }),
-    );
-
-    const secureLinks = Array.from(el.querySelectorAll<HTMLImageElement>(`img[src^="${SECURE_PROTOCOL}//"]`));
-    await Promise.all(secureLinks.map(async (img) => this.swapImageSource(img)));
-
-    ctx.addChild(new SecureWebdavRenderChild(el));
-  }
-
-  private async processSecureCodeBlock(source: string, el: HTMLElement, ctx: MarkdownPostProcessorContext) {
-    const parsed = this.parseSecureImageBlock(source);
-    if (!parsed?.path) {
-      el.createEl("div", {
-        text: this.t("安全图片代码块格式无效。", "Invalid secure image code block format."),
-      });
-      return;
-    }
-
-    await this.renderSecureImageIntoElement(el, parsed.path, parsed.alt || parsed.path);
-    ctx.addChild(new SecureWebdavRenderChild(el));
-  }
-
-  private async renderSecureImageIntoElement(el: HTMLElement, remotePath: string, alt: string) {
-    const img = document.createElement("img");
-    img.alt = alt;
-    img.setAttribute("data-secure-webdav", remotePath);
-    img.classList.add("secure-webdav-image", "is-loading");
-    el.empty();
-    el.appendChild(img);
-    await this.swapImageSource(img);
-  }
-
-  private parseSecureImageBlock(source: string) {
-    const result: { path: string; alt: string } = { path: "", alt: "" };
-    for (const rawLine of source.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line) {
-        continue;
-      }
-
-      const separatorIndex = line.indexOf(":");
-      if (separatorIndex === -1) {
-        continue;
-      }
-
-      const key = line.slice(0, separatorIndex).trim().toLowerCase();
-      const value = line.slice(separatorIndex + 1).trim();
-      if (key === "path") {
-        result.path = value;
-      } else if (key === "alt") {
-        result.alt = value;
-      }
-    }
-
-    return result.path ? result : null;
-  }
-
-  private async swapImageSource(img: HTMLImageElement) {
-    const remotePath =
-      img.getAttribute("data-secure-webdav") ?? this.extractRemotePath(img.getAttribute("src") ?? "");
-    if (!remotePath) {
-      return;
-    }
-
-    img.classList.add("secure-webdav-image", "is-loading");
-    const originalAlt = img.alt;
-    img.alt = originalAlt || this.t("加载安全图片中...", "Loading secure image...");
-
-    try {
-      const blobUrl = await this.fetchSecureImageBlobUrl(remotePath);
-      img.src = blobUrl;
-      img.alt = originalAlt;
-      img.style.display = "block";
-      img.style.maxWidth = "100%";
-      img.classList.remove("is-loading", "is-error");
-    } catch (error) {
-      console.error("Secure WebDAV image load failed", error);
-      img.replaceWith(this.buildErrorElement(remotePath, error));
-    }
-  }
-
-  private extractRemotePath(src: string) {
-    const prefix = `${SECURE_PROTOCOL}//`;
-    if (!src.startsWith(prefix)) {
-      return null;
-    }
-
-    return src.slice(prefix.length);
   }
 
   private buildRemotePath(fileName: string) {
@@ -2857,26 +2520,6 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
   }
 
-  private buildSecureImageMarkup(remoteUrl: string, alt: string) {
-    const remotePath = this.extractRemotePath(remoteUrl);
-    if (!remotePath) {
-      return `![](${remoteUrl})`;
-    }
-
-    return this.buildSecureImageCodeBlock(remotePath, alt);
-  }
-
-  private buildSecureImageCodeBlock(remotePath: string, alt: string) {
-    const normalizedAlt = (alt || remotePath).replace(/\r?\n/g, " ").trim();
-    const normalizedPath = remotePath.replace(/\r?\n/g, "").trim();
-    return [
-      `\`\`\`${SECURE_CODE_BLOCK}`,
-      `path: ${normalizedPath}`,
-      `alt: ${normalizedAlt}`,
-      "```",
-    ].join("\n");
-  }
-
   private formatEmbedLabel(fileName: string) {
     return this.t(`【安全远程图片｜${fileName}】`, `[Secure remote image | ${fileName}]`);
   }
@@ -2908,7 +2551,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           .replace(
             /<span class="secure-webdav-embed" data-secure-webdav="([^"]+)" aria-label="([^"]*)">.*?<\/span>/g,
             (_match, remotePath: string, alt: string) =>
-              this.buildSecureImageCodeBlock(
+              this.imageSupport.buildSecureImageCodeBlock(
                 this.unescapeHtml(remotePath),
                 this.unescapeHtml(alt) || this.unescapeHtml(remotePath),
               ),
@@ -2916,7 +2559,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           .replace(
             /!\[[^\]]*]\(webdav-secure:\/\/([^)]+)\)/g,
             (_match, remotePath: string) =>
-              this.buildSecureImageCodeBlock(this.unescapeHtml(remotePath), this.unescapeHtml(remotePath)),
+              this.imageSupport.buildSecureImageCodeBlock(this.unescapeHtml(remotePath), this.unescapeHtml(remotePath)),
           );
 
         if (updated === content) {
@@ -2942,10 +2585,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
 
       new Notice(
-        this.t(
-          `已迁移 ${changedFiles} 篇笔记到新的安全图片代码块格式。`,
-          `Migrated ${changedFiles} note(s) to the new secure image code-block format.`,
-        ),
+      this.t(
+        `已迁移 ${changedFiles} 篇笔记到新的安全图片代码块格式。`,
+        `Migrated ${changedFiles} note(s) to the new secure image code-block format.`,
+      ),
         8000,
       );
     } catch (error) {
@@ -2993,17 +2636,6 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       await this.trashIfExists(file);
     }
-  }
-
-  private buildErrorElement(remotePath: string, error: unknown) {
-    const el = document.createElement("div");
-    el.className = "secure-webdav-image is-error";
-    const message = error instanceof Error ? error.message : String(error);
-    el.textContent = this.t(
-      `安全图片加载失败：${remotePath}（${message}）`,
-      `Secure image failed: ${remotePath} (${message})`,
-    );
-    return el;
   }
 
   async runConnectionTest(showModal = false) {
@@ -3113,10 +2745,6 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       .map((value) => value.toString(16).padStart(2, "0"))
       .join("");
   }
-}
-
-class SecureWebdavRenderChild extends MarkdownRenderChild {
-  onunload(): void {}
 }
 
 type UploadRewrite = {
