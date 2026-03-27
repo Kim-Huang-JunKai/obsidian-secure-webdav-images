@@ -110,12 +110,12 @@ async function testPlaceholderReplacement() {
 
   const file = app.vault.addFile("Notes/test.md", "before", { mtime: 1000 });
   const editor = new Editor("intro\n");
-  const task = plugin.createUploadTask(file.path, new TextEncoder().encode("image-bytes").buffer, "image/png", "sample.png");
+  const task = plugin.uploadQueue.createUploadTask(file.path, new TextEncoder().encode("image-bytes").buffer, "image/png", "sample.png");
   editor.setValue(`intro\n${task.placeholder}\nend\n`);
   installMarkdownLeaf(app, file, editor);
   plugin.queue = [task];
 
-  await plugin.processTask(task);
+  await plugin.uploadQueue.processTask(task);
 
   assert.equal(calls.length, 1, "upload should call PUT once");
   assert.equal(calls[0].method, "PUT", "upload should use PUT");
@@ -146,7 +146,7 @@ async function testSyncWaitsForImageQueue() {
   const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
   const gate = deferred();
   let started = false;
-  const task = plugin.createUploadTask(
+  const task = plugin.uploadQueue.createUploadTask(
     "Notes/pending.md",
     new TextEncoder().encode("pending").buffer,
     "image/png",
@@ -178,7 +178,7 @@ async function testQueueDedupesActiveTask() {
   const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
   const gate = deferred();
   let starts = 0;
-  const task = plugin.createUploadTask(
+  const task = plugin.uploadQueue.createUploadTask(
     "Notes/dedup.md",
     new TextEncoder().encode("dedupe").buffer,
     "image/png",
@@ -191,9 +191,9 @@ async function testQueueDedupesActiveTask() {
     await gate.promise;
   };
 
-  const firstPass = plugin.processPendingTasks();
+  const firstPass = plugin.uploadQueue.processPendingTasks();
   await delay(20);
-  const secondPass = plugin.processPendingTasks();
+  const secondPass = plugin.uploadQueue.processPendingTasks();
   await delay(20);
 
   assert.equal(starts, 1, "pending task should only start once even if the queue is processed twice");
@@ -212,7 +212,7 @@ async function testPermanentUploadFailureRewritesPlaceholder() {
 
   const file = app.vault.addFile("Notes/failure.md", "before", { mtime: 1000 });
   const editor = new Editor("intro\n");
-  const task = plugin.createUploadTask(
+  const task = plugin.uploadQueue.createUploadTask(
     file.path,
     new TextEncoder().encode("broken-image").buffer,
     "image/png",
@@ -225,7 +225,7 @@ async function testPermanentUploadFailureRewritesPlaceholder() {
   const originalConsoleError = console.error;
   console.error = () => {};
   try {
-    await plugin.processTask(task);
+    await plugin.uploadQueue.processTask(task);
   } finally {
     console.error = originalConsoleError;
   }
@@ -255,7 +255,7 @@ async function testLazyStubRefusesUpload() {
   ].join("\n");
 
   await assert.rejects(
-    () => plugin.uploadContentFileToRemote(file, plugin.buildVaultSyncRemotePath("Notes/lazy.md"), stub),
+    () => plugin.uploadContentFileToRemote(file, plugin.syncSupport.buildVaultSyncRemotePath("Notes/lazy.md"), stub),
     /Refusing to upload a lazy-note placeholder|拒绝把按需加载占位笔记上传为远端正文/,
   );
   assert.equal(requestCalls, 0, "lazy placeholder should never reach remote upload");
@@ -291,8 +291,8 @@ async function testRenameDoesNotRestoreOldPath() {
   const oldPath = "Notes/old-title.md";
   const newPath = "Notes/new-title.md";
   const newFile = app.vault.addFile(newPath, "fresh content", { mtime: 2000 });
-  const oldRemotePath = plugin.buildVaultSyncRemotePath(oldPath);
-  const newRemotePath = plugin.buildVaultSyncRemotePath(newPath);
+  const oldRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(oldPath);
+  const newRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(newPath);
   const newLocalSignature = await plugin.buildCurrentLocalSignature(newFile, "fresh content");
 
   plugin.syncIndex.set(oldPath, {
@@ -303,7 +303,7 @@ async function testRenameDoesNotRestoreOldPath() {
   plugin.uploadQueue.deps.schedulePriorityNoteSync = () => {};
 
   await plugin.handleVaultRename(newFile, oldPath);
-  const tombstonePath = plugin.buildDeletionRemotePath(oldPath);
+  const tombstonePath = plugin.syncSupport.buildDeletionRemotePath(oldPath);
   const tombstoneUrl = plugin.buildUploadUrl(tombstonePath);
   assert.ok(remoteStore.has(tombstoneUrl), "rename should write a remote tombstone");
 
@@ -358,7 +358,7 @@ async function testDeletionTombstoneDeletesStaleCopy() {
   const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
 
   const file = app.vault.addFile("Notes/stale.md", "stale body", { mtime: 1000 });
-  const remotePath = plugin.buildVaultSyncRemotePath(file.path);
+  const remotePath = plugin.syncSupport.buildVaultSyncRemotePath(file.path);
   const remoteState = createRemoteFileState(remotePath, "stale body", 1500);
   const tombstone = {
     path: file.path,
@@ -388,7 +388,7 @@ async function testDeletionTombstoneDeletesStaleCopy() {
   assert.equal(app.vault.getAbstractFileByPath(file.path), null, "stale local copy should be removed");
   assert.ok(deletedPaths.includes(remotePath), "matching remote content should be deleted");
   assert.ok(
-    !deletedPaths.includes(plugin.buildDeletionRemotePath(file.path)),
+    !deletedPaths.includes(plugin.syncSupport.buildDeletionRemotePath(file.path)),
     "authoritative tombstone should stay in place after it deletes the stale copy",
   );
   assert.equal(plugin.syncIndex.has(file.path), false, "sync index should drop the deleted note");
@@ -400,7 +400,7 @@ async function testFreshLocalEditWinsOverTombstone() {
   const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
 
   const file = app.vault.addFile("Notes/keep.md", "fresh local edit", { mtime: 9000 });
-  const remotePath = plugin.buildVaultSyncRemotePath(file.path);
+  const remotePath = plugin.syncSupport.buildVaultSyncRemotePath(file.path);
   const remoteState = createRemoteFileState(remotePath, "original remote body", 1500);
   const tombstone = {
     path: file.path,
@@ -440,7 +440,7 @@ async function testFreshLocalEditWinsOverTombstone() {
   assert.ok(app.vault.getAbstractFileByPath(file.path), "newer local edit should be preserved");
   assert.ok(deletedPaths.length >= 1, "the tombstone should be cleaned up");
   assert.ok(
-    deletedPaths.every((path) => path === plugin.buildDeletionRemotePath(file.path)),
+    deletedPaths.every((path) => path === plugin.syncSupport.buildDeletionRemotePath(file.path)),
     "only the tombstone should be cleaned up",
   );
   assert.deepEqual(uploadedPaths, [remotePath], "fresh local content should be re-uploaded instead of deleted");

@@ -138,6 +138,10 @@ export class SecureWebdavSyncSupport {
   }
 
   private normalizeFolder(input: string) {
-    return input.replace(/^\/+/, "").replace(/\/+$/, "") + "/";
+    return normalizeFolder(input);
   }
+}
+
+export function normalizeFolder(input: string) {
+  return input.replace(/^\/+/, "").replace(/\/+$/, "") + "/";
 }
