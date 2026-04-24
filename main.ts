@@ -663,12 +663,16 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       if (this.isHttpUrl(rawLink)) {
         if (!seen.has(match[0])) {
-          const remoteUrl = await this.uploadRemoteImageUrl(rawLink, uploadCache);
-          const altText = this.extractMarkdownAltText(match[0]) || this.getDisplayNameFromUrl(rawLink);
-          seen.set(match[0], {
-            original: match[0],
-            rewritten: this.imageSupport.buildSecureImageMarkup(remoteUrl, altText),
-          });
+          try {
+            const remoteUrl = await this.uploadRemoteImageUrl(rawLink, uploadCache);
+            const altText = this.extractMarkdownAltText(match[0]) || this.getDisplayNameFromUrl(rawLink);
+            seen.set(match[0], {
+              original: match[0],
+              rewritten: this.imageSupport.buildSecureImageMarkup(remoteUrl, altText),
+            });
+          } catch (e: any) {
+            console.warn(`[secure-webdav-images] 跳过失败的远程图片 ${rawLink}`, e?.message);
+          }
         }
         continue;
       }
@@ -694,12 +698,16 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         continue;
       }
 
-      const remoteUrl = await this.uploadRemoteImageUrl(rawLink, uploadCache);
-      const altText = this.extractHtmlImageAltText(match[0]) || this.getDisplayNameFromUrl(rawLink);
-      seen.set(match[0], {
-        original: match[0],
-        rewritten: this.imageSupport.buildSecureImageMarkup(remoteUrl, altText),
-      });
+      try {
+        const remoteUrl = await this.uploadRemoteImageUrl(rawLink, uploadCache);
+        const altText = this.extractHtmlImageAltText(match[0]) || this.getDisplayNameFromUrl(rawLink);
+        seen.set(match[0], {
+          original: match[0],
+          rewritten: this.imageSupport.buildSecureImageMarkup(remoteUrl, altText),
+        });
+      } catch (e: any) {
+        console.warn(`[secure-webdav-images] 跳过失败的远程图片 ${rawLink}`, e?.message);
+      }
     }
 
     return [...seen.values()];
