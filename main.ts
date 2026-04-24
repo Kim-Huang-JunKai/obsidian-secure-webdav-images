@@ -10,6 +10,7 @@
   Setting,
   TAbstractFile,
   TFile,
+  TFolder,
   normalizePath,
   requestUrl as obsidianRequestUrl,
 } from "obsidian";
@@ -114,6 +115,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   private remoteCleanupInFlight = new Set<string>();
   private noteAccessTimestamps = new Map<string, number>();
   private syncIndex = new Map<string, SyncIndexEntry>();
+  private syncedDirectories = new Set<string>();
   private missingLazyRemoteNotes = new Map<string, MissingLazyRemoteRecord>();
   private pendingVaultMutationPromises = new Set<Promise<void>>();
   private priorityNoteSyncTimeouts = new Map<string, number>();
@@ -291,6 +293,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       this.queue = [];
       this.noteAccessTimestamps = new Map();
       this.syncIndex = new Map();
+      this.syncedDirectories = new Set();
       this.missingLazyRemoteNotes = new Map();
       return;
     }
@@ -328,6 +331,9 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         typeof candidate.lastVaultSyncAt === "number" ? candidate.lastVaultSyncAt : 0;
       this.lastVaultSyncStatus =
         typeof candidate.lastVaultSyncStatus === "string" ? candidate.lastVaultSyncStatus : "";
+      this.syncedDirectories = new Set(
+        Array.isArray(candidate.syncedDirectories) ? candidate.syncedDirectories as string[] : [],
+      );
       this.normalizeEffectiveSettings();
       return;
     }
@@ -336,6 +342,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.queue = [];
     this.noteAccessTimestamps = new Map();
     this.syncIndex = new Map();
+    this.syncedDirectories = new Set();
     this.missingLazyRemoteNotes = new Map();
     this.lastVaultSyncAt = 0;
     this.lastVaultSyncStatus = "";
@@ -386,6 +393,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       noteAccessTimestamps: Object.fromEntries(this.noteAccessTimestamps.entries()),
       missingLazyRemoteNotes: Object.fromEntries(this.missingLazyRemoteNotes.entries()),
       syncIndex: Object.fromEntries(this.syncIndex.entries()),
+      syncedDirectories: [...this.syncedDirectories],
       lastVaultSyncAt: this.lastVaultSyncAt,
       lastVaultSyncStatus: this.lastVaultSyncStatus,
     });
@@ -1116,24 +1124,27 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         uploaded: 0, restoredFromRemote: 0, downloadedOrUpdated: 0, skipped: 0,
         deletedRemoteFiles: 0, deletedLocalFiles: 0, deletedLocalStubs: 0,
         missingRemoteBackedNotes: 0, purgedMissingLazyNotes: 0,
-        deletedRemoteDirectories: 0, evictedNotes: 0,
+        deletedRemoteDirectories: 0, createdRemoteDirectories: 0,
+        deletedLocalDirectories: 0, createdLocalDirectories: 0,
+        evictedNotes: 0,
       };
 
       await this.reconcileOrphanedSyncEntries(remoteFiles, deletionTombstones, counts);
       await this.reconcileRemoteOnlyFiles(remoteFiles, deletionTombstones, counts);
-      const localRemotePaths = await this.reconcileLocalFiles(remoteFiles, deletionTombstones, counts);
+      await this.reconcileLocalFiles(remoteFiles, deletionTombstones, counts);
 
-      counts.deletedRemoteDirectories = await this.deleteExtraRemoteDirectories(
-        remoteInventory.directories,
-        this.buildExpectedRemoteDirectories(localRemotePaths, this.settings.vaultSyncRemoteFolder),
-      );
+      const dirStats = await this.reconcileDirectories(remoteInventory.directories);
+      counts.deletedRemoteDirectories = dirStats.deletedRemote;
+      counts.createdRemoteDirectories = dirStats.createdRemote;
+      counts.deletedLocalDirectories = dirStats.deletedLocal;
+      counts.createdLocalDirectories = dirStats.createdLocal;
       await this.reconcileRemoteImages();
       counts.evictedNotes = await this.evictStaleSyncedNotes(false);
 
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
-        `已双向同步：上传 ${counts.uploaded} 个文件，从远端拉取 ${counts.restoredFromRemote + counts.downloadedOrUpdated} 个文件，跳过 ${counts.skipped} 个未变化文件，删除远端内容 ${counts.deletedRemoteFiles} 个、本地内容 ${counts.deletedLocalFiles} 个${counts.deletedLocalStubs > 0 ? `（其中失效占位笔记 ${counts.deletedLocalStubs} 篇）` : ""}，清理远端空目录 ${counts.deletedRemoteDirectories} 个${counts.evictedNotes > 0 ? `，回收本地旧笔记 ${counts.evictedNotes} 篇` : ""}${counts.missingRemoteBackedNotes > 0 ? `，并发现 ${counts.missingRemoteBackedNotes} 篇按需笔记缺少远端正文` : ""}${counts.purgedMissingLazyNotes > 0 ? `，确认清理失效占位笔记 ${counts.purgedMissingLazyNotes} 篇` : ""}。`,
-        `Bidirectional sync uploaded ${counts.uploaded} file(s), pulled ${counts.restoredFromRemote + counts.downloadedOrUpdated} file(s) from remote, skipped ${counts.skipped} unchanged file(s), deleted ${counts.deletedRemoteFiles} remote content file(s) and ${counts.deletedLocalFiles} local file(s)${counts.deletedLocalStubs > 0 ? ` (including ${counts.deletedLocalStubs} stale stub note(s))` : ""}, removed ${counts.deletedRemoteDirectories} remote director${counts.deletedRemoteDirectories === 1 ? "y" : "ies"}${counts.evictedNotes > 0 ? `, and evicted ${counts.evictedNotes} stale local note(s)` : ""}${counts.missingRemoteBackedNotes > 0 ? `, while detecting ${counts.missingRemoteBackedNotes} lazy note(s) missing their remote content` : ""}${counts.purgedMissingLazyNotes > 0 ? `, and purged ${counts.purgedMissingLazyNotes} confirmed broken lazy placeholder(s)` : ""}.`,
+        `已双向同步：上传 ${counts.uploaded} 个文件，从远端拉取 ${counts.restoredFromRemote + counts.downloadedOrUpdated} 个文件，跳过 ${counts.skipped} 个未变化文件，删除远端内容 ${counts.deletedRemoteFiles} 个、本地内容 ${counts.deletedLocalFiles} 个${counts.deletedLocalStubs > 0 ? `（其中失效占位笔记 ${counts.deletedLocalStubs} 篇）` : ""}，${counts.deletedRemoteDirectories > 0 || counts.createdRemoteDirectories > 0 ? `删除远端目录 ${counts.deletedRemoteDirectories} 个、创建远端目录 ${counts.createdRemoteDirectories} 个、` : ""}${counts.deletedLocalDirectories > 0 || counts.createdLocalDirectories > 0 ? `删除本地目录 ${counts.deletedLocalDirectories} 个、创建本地目录 ${counts.createdLocalDirectories} 个、` : ""}${counts.evictedNotes > 0 ? `回收本地旧笔记 ${counts.evictedNotes} 篇、` : ""}${counts.missingRemoteBackedNotes > 0 ? `发现 ${counts.missingRemoteBackedNotes} 篇按需笔记缺少远端正文、` : ""}${counts.purgedMissingLazyNotes > 0 ? `确认清理失效占位笔记 ${counts.purgedMissingLazyNotes} 篇、` : ""}。`.replace(/、。/, "。"),
+        `Bidirectional sync uploaded ${counts.uploaded} file(s), pulled ${counts.restoredFromRemote + counts.downloadedOrUpdated} file(s) from remote, skipped ${counts.skipped} unchanged file(s), deleted ${counts.deletedRemoteFiles} remote content file(s) and ${counts.deletedLocalFiles} local file(s)${counts.deletedLocalStubs > 0 ? ` (including ${counts.deletedLocalStubs} stale stub note(s))` : ""}${counts.deletedRemoteDirectories > 0 ? `, deleted ${counts.deletedRemoteDirectories} remote director${counts.deletedRemoteDirectories === 1 ? "y" : "ies"}` : ""}${counts.createdRemoteDirectories > 0 ? `, created ${counts.createdRemoteDirectories} remote director${counts.createdRemoteDirectories === 1 ? "y" : "ies"}` : ""}${counts.deletedLocalDirectories > 0 ? `, deleted ${counts.deletedLocalDirectories} local empty director${counts.deletedLocalDirectories === 1 ? "y" : "ies"}` : ""}${counts.createdLocalDirectories > 0 ? `, created ${counts.createdLocalDirectories} local director${counts.createdLocalDirectories === 1 ? "y" : "ies"}` : ""}${counts.evictedNotes > 0 ? `, and evicted ${counts.evictedNotes} stale local note(s)` : ""}${counts.missingRemoteBackedNotes > 0 ? `, while detecting ${counts.missingRemoteBackedNotes} lazy note(s) missing their remote content` : ""}${counts.purgedMissingLazyNotes > 0 ? `, and purged ${counts.purgedMissingLazyNotes} confirmed broken lazy placeholder(s)` : ""}.`,
       );
       await this.savePluginState();
       if (showNotice) {
@@ -2075,6 +2086,84 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     return expected;
+  }
+
+  private async reconcileDirectories(remoteDirectories: Set<string>) {
+    const stats = { createdLocal: 0, createdRemote: 0, deletedLocal: 0, deletedRemote: 0 };
+
+    const remoteLocalPaths = new Set<string>();
+    for (const remoteDir of remoteDirectories) {
+      const localPath = this.syncSupport.remotePathToVaultPath(remoteDir);
+      if (localPath !== null && !this.syncSupport.shouldSkipDirectorySyncPath(localPath)) {
+        remoteLocalPaths.add(normalizePath(localPath));
+      }
+    }
+
+    const localDirPaths = this.syncSupport.collectLocalSyncedDirectories();
+    const knownDirPaths = this.syncedDirectories;
+    const newSyncedDirs = new Set<string>();
+
+    const localOnly = [...localDirPaths].filter((p) => !remoteLocalPaths.has(p));
+    const remoteOnly = [...remoteLocalPaths].filter((p) => !localDirPaths.has(p));
+
+    // Process local-only directories (deepest first for safe deletion)
+    for (const dirPath of [...localOnly].sort((a, b) => b.length - a.length)) {
+      if (knownDirPaths.has(dirPath)) {
+        // Was synced before but gone from remote → another client deleted it
+        const folder = this.app.vault.getAbstractFileByPath(dirPath);
+        if (folder instanceof TFolder && folder.children.length === 0) {
+          try {
+            await this.app.vault.delete(folder, true);
+            stats.deletedLocal += 1;
+          } catch { /* skip if deletion fails */ }
+        } else {
+          // Non-empty local dir: keep it, files will re-upload on next sync
+          newSyncedDirs.add(dirPath);
+        }
+      } else {
+        // New local directory not yet on remote → create on remote
+        const remoteDir = normalizeFolder(this.settings.vaultSyncRemoteFolder) + dirPath;
+        try {
+          await this.ensureRemoteDirectories(remoteDir);
+          stats.createdRemote += 1;
+        } catch { /* skip if creation fails */ }
+        newSyncedDirs.add(dirPath);
+      }
+    }
+
+    // Both sides exist → keep
+    for (const dirPath of localDirPaths) {
+      if (remoteLocalPaths.has(dirPath)) {
+        newSyncedDirs.add(dirPath);
+      }
+    }
+
+    // Process remote-only directories (deepest first for safe deletion)
+    for (const dirPath of [...remoteOnly].sort((a, b) => b.length - a.length)) {
+      if (knownDirPaths.has(dirPath)) {
+        // Was synced before but gone locally → this client deleted it
+        const remoteDir = normalizeFolder(this.settings.vaultSyncRemoteFolder) + dirPath;
+        const response = await this.requestUrl({
+          url: this.buildUploadUrl(remoteDir),
+          method: "DELETE",
+          headers: { Authorization: this.buildAuthHeader() },
+        });
+        if ([200, 202, 204].includes(response.status)) {
+          stats.deletedRemote += 1;
+        } else if (![404, 405, 409].includes(response.status)) {
+          // Unexpected error → keep tracking to retry next sync
+          newSyncedDirs.add(dirPath);
+        }
+      } else {
+        // New remote directory not yet local → create locally
+        await this.ensureLocalParentFolders(dirPath);
+        stats.createdLocal += 1;
+        newSyncedDirs.add(dirPath);
+      }
+    }
+
+    this.syncedDirectories = newSyncedDirs;
+    return stats;
   }
 
   private async deleteExtraRemoteDirectories(remoteDirectories: Set<string>, expectedDirectories: Set<string>) {

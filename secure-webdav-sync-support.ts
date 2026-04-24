@@ -1,4 +1,4 @@
-import { App, TFile, normalizePath } from "obsidian";
+import { App, TFile, TFolder, normalizePath } from "obsidian";
 
 export type DeletionTombstone = {
   path: string;
@@ -41,6 +41,28 @@ export class SecureWebdavSyncSupport {
     }
 
     return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(normalizedPath);
+  }
+
+  shouldSkipDirectorySyncPath(dirPath: string) {
+    const p = normalizePath(dirPath);
+    return (
+      p.startsWith(".obsidian") ||
+      p.startsWith(".trash") ||
+      p.startsWith(".git") ||
+      p.startsWith("node_modules") ||
+      p.startsWith("_plugin_packages") ||
+      p.startsWith(".tmp-")
+    );
+  }
+
+  collectLocalSyncedDirectories() {
+    const dirs = new Set<string>();
+    for (const f of this.deps.app.vault.getAllFolders()) {
+      if (f instanceof TFolder && !f.isRoot() && !this.shouldSkipDirectorySyncPath(f.path)) {
+        dirs.add(normalizePath(f.path));
+      }
+    }
+    return dirs;
   }
 
   collectVaultContentFiles() {
