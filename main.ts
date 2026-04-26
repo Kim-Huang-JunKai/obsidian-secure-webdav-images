@@ -2094,7 +2094,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     const remoteLocalPaths = new Set<string>();
     for (const remoteDir of remoteDirectories) {
       const localPath = this.syncSupport.remotePathToVaultPath(remoteDir);
-      if (localPath !== null && !this.syncSupport.shouldSkipDirectorySyncPath(localPath)) {
+      if (localPath !== null && localPath.length > 0 && !this.syncSupport.shouldSkipDirectorySyncPath(localPath)) {
         remoteLocalPaths.add(normalizePath(localPath));
       }
     }
@@ -2156,7 +2156,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         }
       } else {
         // New remote directory not yet local → create locally
-        await this.ensureLocalParentFolders(dirPath);
+        const existing = this.app.vault.getAbstractFileByPath(dirPath);
+        if (!existing) {
+          await this.app.vault.createFolder(dirPath);
+        }
         stats.createdLocal += 1;
         newSyncedDirs.add(dirPath);
       }

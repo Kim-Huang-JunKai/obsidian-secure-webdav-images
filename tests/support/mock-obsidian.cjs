@@ -1,7 +1,7 @@
 const path = require("path");
 
 function normalizePath(value) {
-  return String(value).replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/");
+  return String(value).replace(/\\/g, "/").replace(/^\/+/, "").replace(/\/+/g, "/").replace(/\/+$/, "");
 }
 
 class TAbstractFile {
@@ -9,6 +9,14 @@ class TAbstractFile {
     this.path = normalizePath(filePath);
     this.name = path.posix.basename(this.path);
     this.parent = null;
+  }
+}
+
+class TFolder extends TAbstractFile {
+  constructor(folderPath) {
+    super(folderPath);
+    this.children = [];
+    this.isRoot = () => false;
   }
 }
 
@@ -176,13 +184,31 @@ class MockVault {
     return [...this.files.values()];
   }
 
+  getAllFolders() {
+    return [...this.folders].map((path) => {
+      const folder = new TFolder(path);
+      folder.children = [...this.files.values()].filter(
+        (file) => file.path.startsWith(path + "/") && file.path.slice(path.length + 1).indexOf("/") === -1,
+      );
+      return folder;
+    });
+  }
+
   getMarkdownFiles() {
     return this.getFiles().filter((file) => file.extension.toLowerCase() === "md");
   }
 
   getAbstractFileByPath(filePath) {
     const normalized = normalizePath(filePath);
-    return this.files.get(normalized) ?? (this.folders.has(normalized) ? { path: normalized } : null);
+    if (this.files.has(normalized)) return this.files.get(normalized);
+    if (this.folders.has(normalized)) {
+      const folder = new TFolder(normalized);
+      folder.children = [...this.files.values()].filter(
+        (file) => file.path.startsWith(normalized + "/") && file.path.slice(normalized.length + 1).indexOf("/") === -1,
+      );
+      return folder;
+    }
+    return null;
   }
 
   async read(file) {
@@ -228,10 +254,12 @@ class MockVault {
 
   async delete(file) {
     this.files.delete(file.path);
+    this.folders.delete(file.path);
   }
 
   async trash(file) {
     this.files.delete(file.path);
+    this.folders.delete(file.path);
   }
 
   async createFolder(folderPath) {
@@ -275,6 +303,7 @@ function createMockObsidianModule(requestUrlHandler) {
     Setting,
     TAbstractFile,
     TFile,
+    TFolder,
     normalizePath,
     requestUrl: requestUrlHandler,
   };
@@ -298,6 +327,7 @@ module.exports = {
   MarkdownView,
   Notice,
   TFile,
+  TFolder,
   TAbstractFile,
   normalizePath,
 };

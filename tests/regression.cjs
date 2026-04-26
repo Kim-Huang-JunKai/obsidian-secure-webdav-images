@@ -35,6 +35,7 @@ function loadPluginClass(requestUrlHandler) {
     Setting: mockObsidian.Setting,
     TAbstractFile: mockObsidian.TAbstractFile,
     TFile: mockObsidian.TFile,
+    TFolder: mockObsidian.TFolder,
     window: {
       setTimeout,
       clearTimeout,
@@ -374,7 +375,7 @@ async function testDeletionTombstoneDeletesStaleCopy() {
   plugin.deleteRemoteContentFile = async (remotePathToDelete) => {
     deletedPaths.push(remotePathToDelete);
   };
-  plugin.deleteExtraRemoteDirectories = async () => 0;
+  plugin.reconcileDirectories = async () => ({ createdLocal: 0, createdRemote: 0, deletedLocal: 0, deletedRemote: 0 });
   plugin.reconcileRemoteImages = async () => ({ deletedFiles: 0, deletedDirectories: 0 });
   plugin.evictStaleSyncedNotes = async () => 0;
   plugin.syncIndex.set(file.path, {
@@ -426,7 +427,7 @@ async function testFreshLocalEditWinsOverTombstone() {
   plugin.deleteRemoteContentFile = async (remotePathToDelete) => {
     deletedPaths.push(remotePathToDelete);
   };
-  plugin.deleteExtraRemoteDirectories = async () => 0;
+  plugin.reconcileDirectories = async () => ({ createdLocal: 0, createdRemote: 0, deletedLocal: 0, deletedRemote: 0 });
   plugin.reconcileRemoteImages = async () => ({ deletedFiles: 0, deletedDirectories: 0 });
   plugin.evictStaleSyncedNotes = async () => 0;
   plugin.syncIndex.set(file.path, {
@@ -447,6 +448,81 @@ async function testFreshLocalEditWinsOverTombstone() {
   assert.equal(plugin.syncIndex.get(file.path)?.remotePath, remotePath, "sync index should keep the note mapped to the same remote path");
 }
 
+async function testReconcileDirectoriesDeletesLocalEmptyDir() {
+  const mkcolCalls = [];
+  const deleteCalls = [];
+  const { plugin, app } = createHarness(async (options) => {
+    const { url, method } = options;
+    if (method === "MKCOL") mkcolCalls.push(url);
+    if (method === "DELETE") { deleteCalls.push(url); return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }; }
+    return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+  await app.vault.createFolder("Archive");
+  plugin.syncedDirectories = new Set(["Archive"]);
+
+  const stats = await plugin.reconcileDirectories(new Set());
+
+  assert.equal(stats.deletedLocal, 1, "should delete 1 local empty dir");
+  assert.ok(!app.vault.folders.has("Archive"), "Archive folder should be removed locally");
+}
+
+async function testReconcileDirectoriesCreatesRemoteDir() {
+  const mkcolCalls = [];
+  const { plugin, app } = createHarness(async (options) => {
+    const { url, method } = options;
+    if (method === "MKCOL") mkcolCalls.push(url);
+    return { status: 201, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+  await app.vault.createFolder("NewFolder");
+  plugin.syncedDirectories = new Set();
+
+  const stats = await plugin.reconcileDirectories(new Set());
+
+  assert.equal(stats.createdRemote, 1, "should create 1 remote dir");
+  assert.ok(mkcolCalls.length > 0, "should call MKCOL");
+}
+
+async function testReconcileDirectoriesDeletesRemoteDir() {
+  const deleteCalls = [];
+  const { plugin, app } = createHarness(async (options) => {
+    const { url, method } = options;
+    if (method === "DELETE") { deleteCalls.push(url); return { status: 204, headers: {}, arrayBuffer: new ArrayBuffer(0) }; }
+    return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+  plugin.syncedDirectories = new Set(["RemovedFolder"]);
+  const rootFolder = plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder);
+  const remoteDirs = new Set([rootFolder, rootFolder + "RemovedFolder/"]);
+
+  const stats = await plugin.reconcileDirectories(remoteDirs);
+
+  assert.equal(stats.deletedRemote, 1, "should delete 1 remote dir");
+  assert.ok(deleteCalls.some((url) => url.includes("RemovedFolder")), "should DELETE the removed folder");
+}
+
+async function testReconcileDirectoriesCreatesLocalDir() {
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+  plugin.syncedDirectories = new Set();
+  const rootFolder = plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder);
+  const remoteDirs = new Set([rootFolder, rootFolder + "NewFromRemote/"]);
+
+  const stats = await plugin.reconcileDirectories(remoteDirs);
+
+  assert.equal(stats.createdLocal, 1, "should create 1 local dir");
+  assert.ok(app.vault.folders.has("NewFromRemote"), "NewFromRemote folder should exist locally");
+}
+
+async function testReconcileDirectoriesKeepsNonEmptyLocalDir() {
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+  await app.vault.createFolder("HasFiles");
+  app.vault.addFile("HasFiles/note.md", "content", { mtime: Date.now() });
+  plugin.syncedDirectories = new Set(["HasFiles"]);
+
+  const stats = await plugin.reconcileDirectories(new Set());
+
+  assert.equal(stats.deletedLocal, 0, "should not delete non-empty dir");
+  assert.ok(app.vault.folders.has("HasFiles"), "HasFiles folder should remain locally");
+}
+
 async function run() {
   const tests = [
     ["图片上传后占位替换", testPlaceholderReplacement],
@@ -458,6 +534,11 @@ async function run() {
     ["重命名不会恢复旧路径", testRenameDoesNotRestoreOldPath],
     ["墓碑会删除过时本地副本", testDeletionTombstoneDeletesStaleCopy],
     ["本地新修改会覆盖墓碑而不是被误删", testFreshLocalEditWinsOverTombstone],
+    ["目录同步：删除远端已删除的本地空目录", testReconcileDirectoriesDeletesLocalEmptyDir],
+    ["目录同步：新本地目录上传到远端", testReconcileDirectoriesCreatesRemoteDir],
+    ["目录同步：本地已删除目录从远端删除", testReconcileDirectoriesDeletesRemoteDir],
+    ["目录同步：远端新目录在本地创建", testReconcileDirectoriesCreatesLocalDir],
+    ["目录同步：非空本地目录不会被删除", testReconcileDirectoriesKeepsNonEmptyLocalDir],
   ];
 
   const failures = [];
