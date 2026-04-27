@@ -1531,7 +1531,13 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       current = current ? `${current}/${segments[index]}` : segments[index];
       const existing = this.app.vault.getAbstractFileByPath(current);
       if (!existing) {
-        await this.app.vault.createFolder(current);
+        try {
+          await this.app.vault.createFolder(current);
+        } catch (e) {
+          if (!this.app.vault.getAbstractFileByPath(current)) {
+            throw e;
+          }
+        }
       }
     }
   }
