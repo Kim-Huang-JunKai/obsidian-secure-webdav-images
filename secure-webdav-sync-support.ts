@@ -16,6 +16,7 @@ export type RemoteFileLike = {
 type SecureWebdavSyncSupportDeps = {
   app: App;
   getVaultSyncRemoteFolder: () => string;
+  getExcludedSyncFolders?: () => string[];
   deletionFolderSuffix: string;
   encodeBase64Url: (value: string) => string;
   decodeBase64Url: (value: string) => string;
@@ -26,9 +27,23 @@ type SecureWebdavSyncSupportDeps = {
 export class SecureWebdavSyncSupport {
   constructor(private readonly deps: SecureWebdavSyncSupportDeps) {}
 
+  isExcludedSyncPath(path: string) {
+    const normalizedPath = normalizePath(path).replace(/^\/+/, "").replace(/\/+$/, "");
+    if (!normalizedPath) {
+      return false;
+    }
+
+    const folders = this.deps.getExcludedSyncFolders?.() ?? [];
+    return folders.some((folder) => {
+      const normalizedFolder = normalizePath(folder).replace(/^\/+/, "").replace(/\/+$/, "");
+      return normalizedFolder.length > 0 && (normalizedPath === normalizedFolder || normalizedPath.startsWith(`${normalizedFolder}/`));
+    });
+  }
+
   shouldSkipContentSyncPath(path: string) {
     const normalizedPath = normalizePath(path);
     if (
+      this.isExcludedSyncPath(normalizedPath) ||
       normalizedPath.startsWith(".obsidian/") ||
       normalizedPath.startsWith(".trash/") ||
       normalizedPath.startsWith(".git/") ||
@@ -46,6 +61,7 @@ export class SecureWebdavSyncSupport {
   shouldSkipDirectorySyncPath(dirPath: string) {
     const p = normalizePath(dirPath);
     return (
+      this.isExcludedSyncPath(p) ||
       p.startsWith(".obsidian") ||
       p.startsWith(".trash") ||
       p.startsWith(".git") ||

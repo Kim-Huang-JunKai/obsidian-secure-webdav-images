@@ -28,6 +28,7 @@ type SecureWebdavSettings = {
   password: string;
   remoteFolder: string;
   vaultSyncRemoteFolder: string;
+  excludedSyncFolders: string[];
   namingStrategy: "timestamp" | "hash";
   deleteLocalAfterUpload: boolean;
   language: "auto" | "zh" | "en";
@@ -73,6 +74,7 @@ const DEFAULT_SETTINGS: SecureWebdavSettings = {
   password: "",
   remoteFolder: "/remote-images/",
   vaultSyncRemoteFolder: "/vault-sync/",
+  excludedSyncFolders: ["kb"],
   namingStrategy: "hash",
   deleteLocalAfterUpload: true,
   language: "auto",
@@ -109,7 +111,7 @@ const SECURE_NOTE_STUB = "secure-webdav-note-stub";
 export default class SecureWebdavImagesPlugin extends Plugin {
   settings: SecureWebdavSettings = DEFAULT_SETTINGS;
   queue: UploadTask[] = [];
-  private blobUrls: string[] = [];
+  private blobUrls = new Set<string>();
   private readonly maxBlobUrls = 100;
   private noteRemoteRefs = new Map<string, Set<string>>();
   private remoteCleanupInFlight = new Set<string>();
@@ -170,6 +172,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.syncSupport = new SecureWebdavSyncSupport({
       app: this.app,
       getVaultSyncRemoteFolder: () => this.settings.vaultSyncRemoteFolder,
+      getExcludedSyncFolders: () => this.settings.excludedSyncFolders ?? [],
       deletionFolderSuffix: this.deletionFolderSuffix,
       encodeBase64Url: (value) =>
         this.arrayBufferToBase64(this.encodeUtf8(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""),
@@ -228,9 +231,13 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.registerMarkdownPostProcessor((el, ctx) => {
       void this.imageSupport.processSecureImages(el, ctx);
     });
-    this.registerMarkdownCodeBlockProcessor(SECURE_CODE_BLOCK, (source, el, ctx) => {
-      void this.imageSupport.processSecureCodeBlock(source, el, ctx);
-    });
+    try {
+      this.registerMarkdownCodeBlockProcessor(SECURE_CODE_BLOCK, (source, el, ctx) => {
+        void this.imageSupport.processSecureCodeBlock(source, el, ctx);
+      });
+    } catch {
+      console.warn("[secure-webdav-images] code block processor already registered, skipping");
+    }
 
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
@@ -353,6 +360,19 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     // Keep the public settings surface intentionally small and deterministic.
     this.settings.deleteLocalAfterUpload = true;
     this.settings.autoSyncIntervalMinutes = Math.max(0, Math.floor(this.settings.autoSyncIntervalMinutes || 0));
+    const rawExcluded = this.settings.excludedSyncFolders as unknown;
+    const excluded = Array.isArray(rawExcluded)
+      ? rawExcluded
+      : typeof rawExcluded === "string"
+        ? rawExcluded.split(/[,\n]/)
+        : DEFAULT_SETTINGS.excludedSyncFolders;
+    this.settings.excludedSyncFolders = [
+      ...new Set(
+        excluded
+          .map((value) => normalizePath(String(value).trim()).replace(/^\/+/, "").replace(/\/+$/, ""))
+          .filter((value) => value.length > 0),
+      ),
+    ];
   }
 
   private normalizeFolder(input: string) {
@@ -1175,6 +1195,11 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         continue;
       }
 
+      if (this.syncSupport.shouldSkipContentSyncPath(path)) {
+        this.syncIndex.delete(path);
+        continue;
+      }
+
       const previous = this.syncIndex.get(path);
       if (!previous) {
         this.syncIndex.delete(path);
@@ -1221,6 +1246,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     for (const remote of [...remoteFiles.values()].sort((a, b) => a.remotePath.localeCompare(b.remotePath))) {
       const vaultPath = this.syncSupport.remotePathToVaultPath(remote.remotePath);
       if (!vaultPath || currentPaths.has(vaultPath)) {
+        continue;
+      }
+
+      if (this.syncSupport.shouldSkipContentSyncPath(vaultPath)) {
         continue;
       }
 
@@ -1529,12 +1558,12 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     let current = "";
     for (let index = 0; index < segments.length - 1; index += 1) {
       current = current ? `${current}/${segments[index]}` : segments[index];
-      const existing = this.app.vault.getAbstractFileByPath(current);
-      if (!existing) {
+      if (!(await this.app.vault.adapter.exists(current))) {
         try {
-          await this.app.vault.createFolder(current);
+          await this.app.vault.adapter.mkdir(current);
         } catch (e) {
-          if (!this.app.vault.getAbstractFileByPath(current)) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!msg.includes("already exists")) {
             throw e;
           }
         }
@@ -1553,23 +1582,40 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.assertResponseSuccess(response, "GET");
 
     await this.ensureLocalParentFolders(vaultPath);
-    const current = existingFile ?? this.getVaultFileByPath(vaultPath);
     const options = {
       mtime: remote.lastModified > 0 ? remote.lastModified : Date.now(),
     };
-    if (!current) {
-      if (vaultPath.toLowerCase().endsWith(".md")) {
+    const isMd = vaultPath.toLowerCase().endsWith(".md");
+    const current =
+      existingFile ?? this.getVaultFileByPath(vaultPath) ?? this.app.vault.getAbstractFileByPath(vaultPath);
+    if (current && current instanceof TFile) {
+      if (current.extension === "md") {
+        await this.app.vault.modify(current, this.decodeUtf8(response.arrayBuffer), options);
+      } else {
+        await this.app.vault.modifyBinary(current, response.arrayBuffer, options);
+      }
+      return;
+    }
+    try {
+      if (isMd) {
         await this.app.vault.create(vaultPath, this.decodeUtf8(response.arrayBuffer), options);
       } else {
         await this.app.vault.createBinary(vaultPath, response.arrayBuffer, options);
       }
-      return;
-    }
-
-    if (current.extension === "md") {
-      await this.app.vault.modify(current, this.decodeUtf8(response.arrayBuffer), options);
-    } else {
-      await this.app.vault.modifyBinary(current, response.arrayBuffer, options);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("already exists")) {
+        const file = this.app.vault.getAbstractFileByPath(vaultPath);
+        if (file && file instanceof TFile) {
+          if (file.extension === "md") {
+            await this.app.vault.modify(file, this.decodeUtf8(response.arrayBuffer), options);
+          } else {
+            await this.app.vault.modifyBinary(file, response.arrayBuffer, options);
+          }
+          return;
+        }
+      }
+      throw e;
     }
   }
 
@@ -2162,13 +2208,12 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         }
       } else {
         // New remote directory not yet local → create locally
-        const existing = this.app.vault.getAbstractFileByPath(dirPath);
-        if (!existing) {
+        if (!(await this.app.vault.adapter.exists(dirPath))) {
           try {
-            await this.app.vault.createFolder(dirPath);
+            await this.app.vault.adapter.mkdir(dirPath);
           } catch (e) {
-            // May already exist from ensureLocalParentFolders during file download
-            if (!this.app.vault.getAbstractFileByPath(dirPath)) {
+            const msg = e instanceof Error ? e.message : String(e);
+            if (!msg.includes("already exists")) {
               throw e;
             }
           }
@@ -2331,13 +2376,15 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     });
     const blobUrl = URL.createObjectURL(blob);
     this.evictBlobUrlsIfNeeded();
-    this.blobUrls.push(blobUrl);
+    this.blobUrls.add(blobUrl);
     return blobUrl;
   }
 
   private evictBlobUrlsIfNeeded() {
-    while (this.blobUrls.length >= this.maxBlobUrls) {
-      URL.revokeObjectURL(this.blobUrls.shift()!);
+    while (this.blobUrls.size >= this.maxBlobUrls) {
+      const oldest = this.blobUrls.values().next().value!;
+      this.blobUrls.delete(oldest);
+      URL.revokeObjectURL(oldest);
     }
   }
 
@@ -2906,6 +2953,25 @@ class SecureWebdavSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
+      .setName(this.plugin.t("不同步目录", "Excluded sync folders"))
+      .setDesc(
+        this.plugin.t(
+          "这些 vault 目录不会被内容同步上传、从远端恢复或进行目录对账。支持逗号或换行分隔，默认：kb。",
+          "These vault folders are not uploaded, restored from remote, or reconciled as directories. Separate entries with commas or new lines. Default: kb.",
+        ),
+      )
+      .addTextArea((text) =>
+        text
+          .setPlaceholder("kb")
+          .setValue((this.plugin.settings.excludedSyncFolders ?? []).join("\n"))
+          .onChange(async (value) => {
+            this.plugin.settings.excludedSyncFolders = value.split(/[,\n]/);
+            this.plugin.normalizeEffectiveSettings();
+            await this.plugin.saveSettings();
+          }),
+      );
+
+    new Setting(containerEl)
       .setName(this.plugin.t("自动同步频率", "Auto sync frequency"))
       .setDesc(
         this.plugin.t(
@@ -3030,4 +3096,3 @@ class ResultModal extends Modal {
     this.contentEl.empty();
   }
 }
-
