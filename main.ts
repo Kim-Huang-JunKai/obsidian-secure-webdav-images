@@ -2164,7 +2164,14 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         // New remote directory not yet local → create locally
         const existing = this.app.vault.getAbstractFileByPath(dirPath);
         if (!existing) {
-          await this.app.vault.createFolder(dirPath);
+          try {
+            await this.app.vault.createFolder(dirPath);
+          } catch (e) {
+            // May already exist from ensureLocalParentFolders during file download
+            if (!this.app.vault.getAbstractFileByPath(dirPath)) {
+              throw e;
+            }
+          }
         }
         stats.createdLocal += 1;
         newSyncedDirs.add(dirPath);
