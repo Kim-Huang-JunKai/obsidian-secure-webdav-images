@@ -63,6 +63,11 @@ type MissingLazyRemoteRecord = {
   missCount: number;
 };
 
+type PendingDeletionEntry = {
+  remotePath: string;
+  remoteSignature?: string;
+};
+
 type RemoteInventory = {
   files: Map<string, RemoteFileState>;
   directories: Set<string>;
@@ -119,6 +124,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   private syncIndex = new Map<string, SyncIndexEntry>();
   private syncedDirectories = new Set<string>();
   private missingLazyRemoteNotes = new Map<string, MissingLazyRemoteRecord>();
+  private pendingVaultSyncPaths = new Set<string>();
+  private pendingVaultDeletionPaths = new Map<string, PendingDeletionEntry>();
   private pendingVaultMutationPromises = new Set<Promise<void>>();
   private priorityNoteSyncTimeouts = new Map<string, number>();
   private priorityNoteSyncsInFlight = new Set<string>();
@@ -217,9 +224,17 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
     this.addCommand({
       id: "sync-configured-vault-content-to-webdav",
-      name: "Sync vault content to WebDAV",
+      name: "Fast sync changed vault content to WebDAV",
       callback: () => {
         void this.runManualSync();
+      },
+    });
+
+    this.addCommand({
+      id: "full-reconcile-vault-content-to-webdav",
+      name: "Full reconcile vault content with WebDAV",
+      callback: () => {
+        void this.runFullReconcileSync();
       },
     });
 
@@ -302,6 +317,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       this.syncIndex = new Map();
       this.syncedDirectories = new Set();
       this.missingLazyRemoteNotes = new Map();
+      this.pendingVaultSyncPaths = new Set();
+      this.pendingVaultDeletionPaths = new Map();
       return;
     }
 
@@ -327,6 +344,23 @@ export default class SecureWebdavImagesPlugin extends Plugin {
           })
           .map(([path, value]) => [path, value as MissingLazyRemoteRecord]),
       );
+      this.pendingVaultSyncPaths = new Set(
+        Array.isArray(candidate.pendingVaultSyncPaths)
+          ? candidate.pendingVaultSyncPaths.filter((path): path is string => typeof path === "string")
+          : [],
+      );
+      this.pendingVaultDeletionPaths = new Map();
+      for (const [path, rawEntry] of Object.entries((candidate.pendingVaultDeletionPaths as Record<string, unknown> | undefined) ?? {})) {
+        if (!rawEntry || typeof rawEntry !== "object") {
+          continue;
+        }
+        const entry = rawEntry as Record<string, unknown>;
+        const remotePath = typeof entry.remotePath === "string" && entry.remotePath.length > 0
+          ? entry.remotePath
+          : `${this.normalizeFolder(this.settings.vaultSyncRemoteFolder)}${path}`;
+        const remoteSignature = typeof entry.remoteSignature === "string" ? entry.remoteSignature : undefined;
+        this.pendingVaultDeletionPaths.set(path, { remotePath, remoteSignature });
+      }
       this.syncIndex = new Map();
       for (const [path, rawEntry] of Object.entries((candidate.syncIndex as Record<string, unknown> | undefined) ?? {})) {
         const normalized = this.normalizeSyncIndexEntry(path, rawEntry);
@@ -351,6 +385,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.syncIndex = new Map();
     this.syncedDirectories = new Set();
     this.missingLazyRemoteNotes = new Map();
+    this.pendingVaultSyncPaths = new Set();
+    this.pendingVaultDeletionPaths = new Map();
     this.lastVaultSyncAt = 0;
     this.lastVaultSyncStatus = "";
     this.normalizeEffectiveSettings();
@@ -400,7 +436,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
     this.autoSyncTickInProgress = true;
     try {
-      await this.syncConfiguredVaultContent(false);
+      await this.syncPendingVaultContent(false);
     } finally {
       this.autoSyncTickInProgress = false;
     }
@@ -412,6 +448,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       queue: this.queue,
       noteAccessTimestamps: Object.fromEntries(this.noteAccessTimestamps.entries()),
       missingLazyRemoteNotes: Object.fromEntries(this.missingLazyRemoteNotes.entries()),
+      pendingVaultSyncPaths: [...this.pendingVaultSyncPaths],
+      pendingVaultDeletionPaths: Object.fromEntries(this.pendingVaultDeletionPaths.entries()),
       syncIndex: Object.fromEntries(this.syncIndex.entries()),
       syncedDirectories: [...this.syncedDirectories],
       lastVaultSyncAt: this.lastVaultSyncAt,
@@ -484,6 +522,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   async runManualSync() {
+    await this.syncPendingVaultContent(true);
+  }
+
+  async runFullReconcileSync() {
     await this.syncConfiguredVaultContent(true);
   }
 
@@ -497,23 +539,29 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   }
 
   private async handleVaultModify(file: TAbstractFile) {
-    if (!(file instanceof TFile) || file.extension !== "md") {
+    if (!(file instanceof TFile)) {
       return;
     }
 
-    const content = await this.app.vault.read(file);
-    const nextRefs = this.extractRemotePathsFromText(content);
-    const previousRefs = this.noteRemoteRefs.get(file.path) ?? new Set<string>();
-    this.noteRemoteRefs.set(file.path, nextRefs);
+    this.markPendingVaultSync(file.path);
 
-    const added = [...nextRefs].filter((value) => !previousRefs.has(value));
-    const removed = [...previousRefs].filter((value) => !nextRefs.has(value));
-    if (added.length > 0) {
-      this.schedulePriorityNoteSync(file.path, "image-add");
+    if (file.extension === "md") {
+      const content = await this.app.vault.read(file);
+      const nextRefs = this.extractRemotePathsFromText(content);
+      const previousRefs = this.noteRemoteRefs.get(file.path) ?? new Set<string>();
+      this.noteRemoteRefs.set(file.path, nextRefs);
+
+      const added = [...nextRefs].filter((value) => !previousRefs.has(value));
+      const removed = [...previousRefs].filter((value) => !nextRefs.has(value));
+      if (added.length > 0) {
+        this.schedulePriorityNoteSync(file.path, "image-add");
+      }
+      if (removed.length > 0) {
+        this.schedulePriorityNoteSync(file.path, "image-remove");
+      }
     }
-    if (removed.length > 0) {
-      this.schedulePriorityNoteSync(file.path, "image-remove");
-    }
+
+    await this.savePluginState();
   }
 
   private async handleVaultDelete(file: TAbstractFile) {
@@ -522,7 +570,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     if (!this.syncSupport.shouldSkipContentSyncPath(file.path)) {
-      await this.writeDeletionTombstone(file.path, this.syncIndex.get(file.path)?.remoteSignature);
+      this.markPendingVaultDeletion(file.path);
       this.syncIndex.delete(file.path);
       await this.savePluginState();
     }
@@ -538,8 +586,13 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     if (!this.syncSupport.shouldSkipContentSyncPath(oldPath)) {
-      await this.writeDeletionTombstone(oldPath, this.syncIndex.get(oldPath)?.remoteSignature);
+      this.markPendingVaultDeletion(oldPath);
       this.syncIndex.delete(oldPath);
+      await this.savePluginState();
+    }
+
+    if (!this.syncSupport.shouldSkipContentSyncPath(file.path)) {
+      this.markPendingVaultSync(file.path);
       await this.savePluginState();
     }
 
@@ -554,6 +607,31 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         this.schedulePriorityNoteSync(file.path, "image-add");
       }
     }
+  }
+
+  private markPendingVaultSync(path: string) {
+    if (this.syncSupport.shouldSkipContentSyncPath(path)) {
+      this.pendingVaultSyncPaths.delete(path);
+      return;
+    }
+
+    this.pendingVaultDeletionPaths.delete(path);
+    this.pendingVaultSyncPaths.add(path);
+  }
+
+  private markPendingVaultDeletion(path: string) {
+    if (this.syncSupport.shouldSkipContentSyncPath(path)) {
+      this.pendingVaultSyncPaths.delete(path);
+      this.pendingVaultDeletionPaths.delete(path);
+      return;
+    }
+
+    const existing = this.syncIndex.get(path);
+    this.pendingVaultSyncPaths.delete(path);
+    this.pendingVaultDeletionPaths.set(path, {
+      remotePath: existing?.remotePath ?? this.syncSupport.buildVaultSyncRemotePath(path),
+      remoteSignature: existing?.remoteSignature,
+    });
   }
 
   private extractRemotePathsFromText(content: string) {
@@ -631,6 +709,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         remoteSignature: uploadedRemote.signature,
         remotePath,
       });
+      this.pendingVaultSyncPaths.delete(file.path);
       await this.deleteDeletionTombstone(file.path);
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
@@ -1160,6 +1239,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       counts.createdLocalDirectories = dirStats.createdLocal;
       await this.reconcileRemoteImages();
       counts.evictedNotes = await this.evictStaleSyncedNotes(false);
+      this.pendingVaultSyncPaths.clear();
+      this.pendingVaultDeletionPaths.clear();
 
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
@@ -1180,6 +1261,102 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
     } finally {
       this.syncInProgress = false;
+    }
+  }
+
+  async syncPendingVaultContent(showNotice = true) {
+    if (this.syncInProgress) {
+      if (showNotice) {
+        new Notice(this.t("同步正在进行中。", "A sync is already in progress."), 4000);
+      }
+      return;
+    }
+
+    this.syncInProgress = true;
+    const counts = { uploaded: 0, deletedRemoteFiles: 0, skipped: 0 };
+    try {
+      this.ensureConfigured();
+      await this.waitForPendingVaultMutations();
+      const uploadsReady = await this.preparePendingUploadsForSync(showNotice);
+      if (!uploadsReady) {
+        return;
+      }
+
+      await this.processPendingVaultDeletions(counts);
+      await this.processPendingVaultUploads(counts);
+
+      this.lastVaultSyncAt = Date.now();
+      this.lastVaultSyncStatus = this.t(
+        `已快速同步：上传 ${counts.uploaded} 个文件，删除远端内容 ${counts.deletedRemoteFiles} 个，跳过 ${counts.skipped} 个文件。`,
+        `Fast sync uploaded ${counts.uploaded} file(s), deleted ${counts.deletedRemoteFiles} remote content file(s), and skipped ${counts.skipped} file(s).`,
+      );
+      await this.savePluginState();
+      if (showNotice) {
+        new Notice(this.lastVaultSyncStatus, 6000);
+      }
+    } catch (error) {
+      console.error("Fast vault content sync failed", error);
+      this.lastVaultSyncAt = Date.now();
+      this.lastVaultSyncStatus = this.describeError(this.t("快速同步失败", "Fast sync failed"), error);
+      await this.savePluginState();
+      if (showNotice) {
+        new Notice(this.lastVaultSyncStatus, 8000);
+      }
+    } finally {
+      this.syncInProgress = false;
+    }
+  }
+
+  private async processPendingVaultDeletions(counts: { deletedRemoteFiles: number; skipped: number }) {
+    for (const [path, entry] of [...this.pendingVaultDeletionPaths.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      if (this.syncSupport.shouldSkipContentSyncPath(path)) {
+        this.pendingVaultDeletionPaths.delete(path);
+        counts.skipped += 1;
+        continue;
+      }
+
+      await this.writeDeletionTombstone(path, entry.remoteSignature);
+      await this.deleteRemoteContentFile(entry.remotePath);
+      this.syncIndex.delete(path);
+      this.pendingVaultDeletionPaths.delete(path);
+      counts.deletedRemoteFiles += 1;
+    }
+  }
+
+  private async processPendingVaultUploads(counts: { uploaded: number; skipped: number }) {
+    for (const path of [...this.pendingVaultSyncPaths].sort((a, b) => a.localeCompare(b))) {
+      if (this.syncSupport.shouldSkipContentSyncPath(path)) {
+        this.pendingVaultSyncPaths.delete(path);
+        counts.skipped += 1;
+        continue;
+      }
+
+      const file = this.getVaultFileByPath(path);
+      if (!(file instanceof TFile)) {
+        this.markPendingVaultDeletion(path);
+        this.pendingVaultSyncPaths.delete(path);
+        counts.skipped += 1;
+        continue;
+      }
+
+      const markdownContent = file.extension === "md" ? await this.readMarkdownContentPreferEditor(file) : undefined;
+      if (file.extension === "md" && this.parseNoteStub(markdownContent ?? "")) {
+        this.pendingVaultSyncPaths.delete(path);
+        counts.skipped += 1;
+        continue;
+      }
+
+      const remotePath = this.syncSupport.buildVaultSyncRemotePath(file.path);
+      const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent);
+      const localSignature = await this.buildCurrentLocalSignature(file, markdownContent);
+      this.syncIndex.set(file.path, {
+        localSignature,
+        remoteSignature: uploadedRemote.signature,
+        remotePath,
+      });
+      await this.deleteDeletionTombstone(file.path);
+      this.pendingVaultSyncPaths.delete(path);
+      counts.uploaded += 1;
     }
   }
 
@@ -3036,12 +3213,23 @@ class SecureWebdavSettingTab extends PluginSettingTab {
       .setName(this.plugin.t("同步状态", "Sync status"))
       .setDesc(
         this.plugin.t(
-          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：立即同步会执行本地与远端的对账，同步笔记与非图片附件，并清理远端冗余文件。图片上传仍由独立队列处理。", "Note: Sync now reconciles local and remote content, syncs notes and non-image attachments, and cleans extra remote files. Image uploads continue to be handled by the separate queue.")}`,
-          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：立即同步会执行本地与远端的对账，同步笔记与非图片附件，并清理远端冗余文件。图片上传仍由独立队列处理。", "Note: Sync now reconciles local and remote content, syncs notes and non-image attachments, and cleans extra remote files. Image uploads continue to be handled by the separate queue.")}`,
+          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步只处理本机变更队列；完整对账会扫描本地与远端差异并清理远端冗余内容。图片上传仍由独立队列处理。", "Note: Fast sync only processes locally changed paths. Full reconcile scans local and remote differences and cleans extra remote content. Image uploads continue to be handled by the separate queue.")}`,
+          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步只处理本机变更队列；完整对账会扫描本地与远端差异并清理远端冗余内容。图片上传仍由独立队列处理。", "Note: Fast sync only processes locally changed paths. Full reconcile scans local and remote differences and cleans extra remote content. Image uploads continue to be handled by the separate queue.")}`,
         ),
       )
       .addButton((button) =>
-        button.setButtonText(this.plugin.t("立即同步", "Sync now")).onClick(async () => {
+        button.setButtonText(this.plugin.t("快速同步", "Fast sync")).onClick(async () => {
+          button.setDisabled(true);
+          try {
+            await this.plugin.syncPendingVaultContent(true);
+            this.display();
+          } finally {
+            button.setDisabled(false);
+          }
+        }),
+      )
+      .addButton((button) =>
+        button.setButtonText(this.plugin.t("完整对账", "Full reconcile")).onClick(async () => {
           button.setDisabled(true);
           try {
             await this.plugin.syncConfiguredVaultContent(true);

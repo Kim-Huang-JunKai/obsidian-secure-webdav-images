@@ -301,9 +301,17 @@ async function testRenameDoesNotRestoreOldPath() {
     remoteSignature: "sig-old",
     remotePath: oldRemotePath,
   });
+  plugin.uploadContentFileToRemote = async (incomingFile, incomingRemotePath, markdownContent) => {
+    const content = markdownContent ?? (await plugin.readMarkdownContentPreferEditor(incomingFile));
+    remoteStore.set(plugin.buildUploadUrl(incomingRemotePath), {
+      body: new TextEncoder().encode(content).buffer,
+    });
+    return createRemoteFileState(incomingRemotePath, content, incomingFile.stat.mtime);
+  };
   plugin.uploadQueue.deps.schedulePriorityNoteSync = () => {};
 
   await plugin.handleVaultRename(newFile, oldPath);
+  await plugin.syncPendingVaultContent(false);
   const tombstonePath = plugin.syncSupport.buildDeletionRemotePath(oldPath);
   const tombstoneUrl = plugin.buildUploadUrl(tombstonePath);
   assert.ok(remoteStore.has(tombstoneUrl), "rename should write a remote tombstone");
@@ -448,6 +456,68 @@ async function testFreshLocalEditWinsOverTombstone() {
   assert.equal(plugin.syncIndex.get(file.path)?.remotePath, remotePath, "sync index should keep the note mapped to the same remote path");
 }
 
+async function testFastSyncUploadsOnlyPendingPaths() {
+  const uploadedPaths = [];
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  const changedFile = app.vault.addFile("Notes/changed.md", "changed", { mtime: 5000 });
+  app.vault.addFile("Notes/unchanged.md", "unchanged", { mtime: 5000 });
+  const changedRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(changedFile.path);
+
+  plugin.pendingVaultSyncPaths.add(changedFile.path);
+  plugin.uploadContentFileToRemote = async (file, remotePath, markdownContent) => {
+    uploadedPaths.push(remotePath);
+    return createRemoteFileState(remotePath, markdownContent ?? file.content ?? "", file.stat.mtime);
+  };
+  plugin.deleteDeletionTombstone = async () => {};
+
+  await plugin.syncPendingVaultContent(false);
+
+  assert.deepEqual(uploadedPaths, [changedRemotePath], "fast sync should upload only queued files");
+  assert.equal(plugin.pendingVaultSyncPaths.size, 0, "successful fast sync should clear uploaded paths");
+  assert.equal(plugin.syncIndex.get(changedFile.path)?.remotePath, changedRemotePath, "fast sync should refresh the sync index");
+  assert.ok(/快速同步|Fast sync/.test(plugin.lastVaultSyncStatus), "fast sync should leave a fast-sync status");
+}
+
+async function testFastSyncDeletesPendingRemote() {
+  const deletedPaths = [];
+  const tombstones = [];
+  const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+  const vaultPath = "Notes/deleted.md";
+  const remotePath = plugin.syncSupport.buildVaultSyncRemotePath(vaultPath);
+
+  plugin.pendingVaultDeletionPaths.set(vaultPath, { remotePath, remoteSignature: "remote-old" });
+  plugin.writeDeletionTombstone = async (path, remoteSignature) => {
+    tombstones.push({ path, remoteSignature });
+  };
+  plugin.deleteRemoteContentFile = async (path) => {
+    deletedPaths.push(path);
+  };
+
+  await plugin.syncPendingVaultContent(false);
+
+  assert.deepEqual(tombstones, [{ path: vaultPath, remoteSignature: "remote-old" }], "fast sync should write a deletion tombstone");
+  assert.deepEqual(deletedPaths, [remotePath], "fast sync should delete the queued remote file");
+  assert.equal(plugin.pendingVaultDeletionPaths.size, 0, "successful fast sync should clear deletion paths");
+}
+
+async function testFastSyncSkipsExcludedPaths() {
+  const uploadedPaths = [];
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  const excludedFile = app.vault.addFile("kb/raw.md", "local wiki data", { mtime: 5000 });
+  plugin.pendingVaultSyncPaths.add(excludedFile.path);
+  plugin.uploadContentFileToRemote = async (_file, remotePath) => {
+    uploadedPaths.push(remotePath);
+    return createRemoteFileState(remotePath, "should not upload");
+  };
+
+  await plugin.syncPendingVaultContent(false);
+
+  assert.deepEqual(uploadedPaths, [], "fast sync should not upload excluded folders");
+  assert.equal(plugin.pendingVaultSyncPaths.size, 0, "excluded queued paths should be discarded");
+}
+
 async function testReconcileDirectoriesDeletesLocalEmptyDir() {
   const mkcolCalls = [];
   const deleteCalls = [];
@@ -535,6 +605,9 @@ async function run() {
     ["墓碑会删除过时本地副本", testDeletionTombstoneDeletesStaleCopy],
     ["本地新修改会覆盖墓碑而不是被误删", testFreshLocalEditWinsOverTombstone],
     ["目录同步：删除远端已删除的本地空目录", testReconcileDirectoriesDeletesLocalEmptyDir],
+    ["快速同步：只上传增量队列文件", testFastSyncUploadsOnlyPendingPaths],
+    ["快速同步：删除队列会写墓碑并删除远端", testFastSyncDeletesPendingRemote],
+    ["快速同步：默认跳过 kb 目录", testFastSyncSkipsExcludedPaths],
     ["目录同步：新本地目录上传到远端", testReconcileDirectoriesCreatesRemoteDir],
     ["目录同步：本地已删除目录从远端删除", testReconcileDirectoriesDeletesRemoteDir],
     ["目录同步：远端新目录在本地创建", testReconcileDirectoriesCreatesLocalDir],

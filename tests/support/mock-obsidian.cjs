@@ -172,6 +172,15 @@ class MockVault {
   constructor() {
     this.files = new Map();
     this.folders = new Set();
+    this.adapter = {
+      exists: async (path) => {
+        const normalized = normalizePath(path);
+        return this.files.has(normalized) || this.folders.has(normalized);
+      },
+      mkdir: async (path) => {
+        await this.createFolder(path);
+      },
+    };
   }
 
   addFile(filePath, content = "", options = {}) {
