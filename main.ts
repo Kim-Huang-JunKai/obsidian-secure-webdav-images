@@ -1460,6 +1460,20 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
   }
 
+  private shouldDeleteLocalBecauseRemoteIsMissing(
+    file: TFile,
+    previous: SyncIndexEntry | undefined,
+    localSignature: string,
+    remotePath: string,
+  ) {
+    if (previous?.remotePath === remotePath && previous.localSignature === localSignature) {
+      return true;
+    }
+
+    const graceMs = 5000;
+    return this.lastVaultSyncAt > 0 && file.stat.mtime <= this.lastVaultSyncAt + graceMs;
+  }
+
   private async reconcileLocalFiles(
     remoteFiles: Map<string, RemoteFileState>,
     deletionTombstones: Map<string, DeletionTombstone>,
@@ -1505,10 +1519,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
 
       const tombstone = deletionTombstones.get(file.path);
-      const unchangedSinceLastSync = previous ? previous.localSignature === localSignature : false;
       if (tombstone) {
         if (
-          unchangedSinceLastSync &&
           this.syncSupport.shouldDeleteLocalFromTombstone(file, tombstone) &&
           this.syncSupport.isTombstoneAuthoritative(tombstone, remote)
         ) {
@@ -1525,6 +1537,13 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
         await this.deleteDeletionTombstone(file.path);
         deletionTombstones.delete(file.path);
+      }
+
+      if (!remote && this.shouldDeleteLocalBecauseRemoteIsMissing(file, previous, localSignature, remotePath)) {
+        await this.removeLocalVaultFile(file);
+        this.syncIndex.delete(file.path);
+        counts.deletedLocalFiles += 1;
+        continue;
       }
 
       if (!remote) {
