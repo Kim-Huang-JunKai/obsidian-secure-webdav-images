@@ -238,10 +238,17 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       },
     });
 
-    const ribbon = this.addRibbonIcon("refresh-cw", this.t("立即同步到 WebDAV", "Sync to WebDAV now"), () => {
+    const fastSyncRibbon = this.addRibbonIcon("zap", this.t("快速同步到 WebDAV", "Fast sync to WebDAV"), () => {
       void this.runManualSync();
     });
-    ribbon.addClass("secure-webdav-sync-ribbon");
+    fastSyncRibbon.addClass("secure-webdav-sync-ribbon");
+    fastSyncRibbon.addClass("secure-webdav-fast-sync-ribbon");
+
+    const fullSyncRibbon = this.addRibbonIcon("refresh-cw", this.t("完整同步到 WebDAV", "Full sync to WebDAV"), () => {
+      void this.runFullReconcileSync();
+    });
+    fullSyncRibbon.addClass("secure-webdav-sync-ribbon");
+    fullSyncRibbon.addClass("secure-webdav-full-sync-ribbon");
 
     this.registerMarkdownPostProcessor((el, ctx) => {
       void this.imageSupport.processSecureImages(el, ctx);
