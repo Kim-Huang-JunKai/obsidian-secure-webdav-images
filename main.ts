@@ -1317,6 +1317,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
   private async queueChangedLocalFilesForFastSync(counts: { detectedLocalChanges: number; skipped: number }) {
     const files = this.syncSupport.collectVaultContentFiles();
+    const recentTouchGraceMs = 1000;
     for (const file of files) {
       const remotePath = this.syncSupport.buildVaultSyncRemotePath(file.path);
       const previous = this.syncIndex.get(file.path);
@@ -1327,7 +1328,9 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
 
       const localSignature = await this.buildCurrentLocalSignature(file, markdownContent);
-      if (!previous || previous.remotePath !== remotePath || previous.localSignature !== localSignature) {
+      const touchedSinceLastSync =
+        this.lastVaultSyncAt > 0 && file.stat.mtime > this.lastVaultSyncAt + recentTouchGraceMs;
+      if (!previous || previous.remotePath !== remotePath || previous.localSignature !== localSignature || touchedSinceLastSync) {
         if (!this.pendingVaultSyncPaths.has(file.path)) {
           counts.detectedLocalChanges += 1;
         }

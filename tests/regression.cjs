@@ -664,6 +664,33 @@ async function testFastSyncUploadsPendingAndScannedLocalChanges() {
   assert.ok(/快速同步|Fast sync/.test(plugin.lastVaultSyncStatus), "fast sync should leave a fast-sync status");
 }
 
+async function testFastSyncUploadsRecentlyTouchedFiles() {
+  const uploadedPaths = [];
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  const file = app.vault.addFile("Notes/touched.md", "same body", { mtime: 12_000 });
+  const remotePath = plugin.syncSupport.buildVaultSyncRemotePath(file.path);
+  const localSignature = await plugin.buildCurrentLocalSignature(file, "same body");
+
+  plugin.lastVaultSyncAt = 8_000;
+  plugin.syncIndex.set(file.path, {
+    localSignature,
+    remoteSignature: "remote-old",
+    remotePath,
+  });
+  plugin.uploadContentFileToRemote = async (incomingFile, incomingRemotePath, markdownContent) => {
+    uploadedPaths.push(incomingRemotePath);
+    return createRemoteFileState(incomingRemotePath, markdownContent ?? incomingFile.content ?? "", incomingFile.stat.mtime);
+  };
+  plugin.deleteDeletionTombstone = async () => {};
+
+  await plugin.syncPendingVaultContent(false);
+
+  assert.deepEqual(uploadedPaths, [remotePath], "fast sync should re-upload files touched after the last sync");
+  assert.equal(plugin.pendingVaultSyncPaths.size, 0, "touched file should clear from pending uploads after sync");
+  assert.ok(/发现 1 个本地变化|found 1 local change/.test(plugin.lastVaultSyncStatus), "fast sync status should count the touched file");
+}
+
 async function testFastSyncDoesNotConvertMissingUploadToDeletion() {
   const deletedPaths = [];
   const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
@@ -814,6 +841,7 @@ async function run() {
     ["完整同步：本地和远端同时变化时创建冲突副本", testBothSidesChangedCreatesConflictCopy],
     ["目录同步：保留远端缺失的本地空目录", testReconcileDirectoriesPreservesLocalEmptyDir],
     ["快速同步：上传队列文件和扫描到的本地变化", testFastSyncUploadsPendingAndScannedLocalChanges],
+    ["快速同步：会补传上次同步后被本地触碰的文件", testFastSyncUploadsRecentlyTouchedFiles],
     ["快速同步：缺失的上传队列项不会变成删除", testFastSyncDoesNotConvertMissingUploadToDeletion],
     ["快速同步：删除队列会写墓碑并删除远端", testFastSyncDeletesPendingRemote],
     ["快速同步：默认跳过 kb 目录", testFastSyncSkipsExcludedPaths],
