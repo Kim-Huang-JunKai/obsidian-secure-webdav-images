@@ -1280,7 +1280,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     this.syncInProgress = true;
-    const counts = { uploaded: 0, deletedRemoteFiles: 0, skipped: 0 };
+    const counts = { uploaded: 0, deletedRemoteFiles: 0, skipped: 0, detectedLocalChanges: 0 };
     try {
       this.ensureConfigured();
       await this.waitForPendingVaultMutations();
@@ -1289,13 +1289,14 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         return;
       }
 
+      await this.queueChangedLocalFilesForFastSync(counts);
       await this.processPendingVaultDeletions(counts);
       await this.processPendingVaultUploads(counts);
 
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
-        `已快速同步：上传 ${counts.uploaded} 个文件，删除远端内容 ${counts.deletedRemoteFiles} 个，跳过 ${counts.skipped} 个文件。`,
-        `Fast sync uploaded ${counts.uploaded} file(s), deleted ${counts.deletedRemoteFiles} remote content file(s), and skipped ${counts.skipped} file(s).`,
+        `已快速同步：发现 ${counts.detectedLocalChanges} 个本地变化，上传 ${counts.uploaded} 个文件，删除远端内容 ${counts.deletedRemoteFiles} 个，跳过 ${counts.skipped} 个文件。`,
+        `Fast sync found ${counts.detectedLocalChanges} local change(s), uploaded ${counts.uploaded} file(s), deleted ${counts.deletedRemoteFiles} remote content file(s), and skipped ${counts.skipped} file(s).`,
       );
       await this.savePluginState();
       if (showNotice) {
@@ -1311,6 +1312,27 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
     } finally {
       this.syncInProgress = false;
+    }
+  }
+
+  private async queueChangedLocalFilesForFastSync(counts: { detectedLocalChanges: number; skipped: number }) {
+    const files = this.syncSupport.collectVaultContentFiles();
+    for (const file of files) {
+      const remotePath = this.syncSupport.buildVaultSyncRemotePath(file.path);
+      const previous = this.syncIndex.get(file.path);
+      const markdownContent = file.extension === "md" ? await this.readMarkdownContentPreferEditor(file) : undefined;
+      if (file.extension === "md" && this.parseNoteStub(markdownContent ?? "")) {
+        counts.skipped += 1;
+        continue;
+      }
+
+      const localSignature = await this.buildCurrentLocalSignature(file, markdownContent);
+      if (!previous || previous.remotePath !== remotePath || previous.localSignature !== localSignature) {
+        if (!this.pendingVaultSyncPaths.has(file.path)) {
+          counts.detectedLocalChanges += 1;
+        }
+        this.markPendingVaultSync(file.path);
+      }
     }
   }
 
@@ -1340,7 +1362,6 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
       const file = this.getVaultFileByPath(path);
       if (!(file instanceof TFile)) {
-        this.markPendingVaultDeletion(path);
         this.pendingVaultSyncPaths.delete(path);
         counts.skipped += 1;
         continue;
@@ -1460,12 +1481,18 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
   }
 
-  private shouldDeleteLocalBecauseRemoteIsMissing(
+  private shouldUploadLocalWhenRemoteIsMissing(
+    file: TFile,
     previous: SyncIndexEntry | undefined,
     localSignature: string,
     remotePath: string,
   ) {
-    return previous?.remotePath === remotePath && previous.localSignature === localSignature;
+    if (previous) {
+      return previous.remotePath !== remotePath || previous.localSignature !== localSignature;
+    }
+
+    const graceMs = 5000;
+    return !this.lastVaultSyncAt || file.stat.mtime > this.lastVaultSyncAt + graceMs;
   }
 
   private async reconcileLocalFiles(
@@ -1540,10 +1567,8 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         deletionTombstones.delete(file.path);
       }
 
-      if (!remote && this.shouldDeleteLocalBecauseRemoteIsMissing(previous, localSignature, remotePath)) {
-        await this.removeLocalVaultFile(file);
-        this.syncIndex.delete(file.path);
-        counts.deletedLocalFiles += 1;
+      if (!remote && !this.shouldUploadLocalWhenRemoteIsMissing(file, previous, localSignature, remotePath)) {
+        counts.skipped += 1;
         continue;
       }
 
@@ -2362,29 +2387,16 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     const localOnly = [...localDirPaths].filter((p) => !remoteLocalPaths.has(p));
     const remoteOnly = [...remoteLocalPaths].filter((p) => !localDirPaths.has(p));
 
-    // Process local-only directories (deepest first for safe deletion)
-    for (const dirPath of [...localOnly].sort((a, b) => b.length - a.length)) {
-      if (knownDirPaths.has(dirPath)) {
-        // Was synced before but gone from remote → another client deleted it
-        const folder = this.app.vault.getAbstractFileByPath(dirPath);
-        if (folder instanceof TFolder && folder.children.length === 0) {
-          try {
-            await this.app.vault.delete(folder, true);
-            stats.deletedLocal += 1;
-          } catch { /* skip if deletion fails */ }
-        } else {
-          // Non-empty local dir: keep it, files will re-upload on next sync
-          newSyncedDirs.add(dirPath);
-        }
-      } else {
-        // New local directory not yet on remote → create on remote
-        const remoteDir = normalizeFolder(this.settings.vaultSyncRemoteFolder) + dirPath;
-        try {
-          await this.ensureRemoteDirectories(remoteDir);
-          stats.createdRemote += 1;
-        } catch { /* skip if creation fails */ }
-        newSyncedDirs.add(dirPath);
+    // Local-only directories are kept locally and created remotely if needed.
+    for (const dirPath of [...localOnly].sort((a, b) => a.length - b.length)) {
+      const remoteDir = normalizeFolder(this.settings.vaultSyncRemoteFolder) + dirPath;
+      try {
+        await this.ensureRemoteDirectories(remoteDir);
+        stats.createdRemote += 1;
+      } catch {
+        // Directory creation failures should not make reconcile destructive.
       }
+      newSyncedDirs.add(dirPath);
     }
 
     // Both sides exist → keep
@@ -2394,37 +2406,20 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
     }
 
-    // Process remote-only directories (deepest first for safe deletion)
-    for (const dirPath of [...remoteOnly].sort((a, b) => b.length - a.length)) {
-      if (knownDirPaths.has(dirPath)) {
-        // Was synced before but gone locally → this client deleted it
-        const remoteDir = normalizeFolder(this.settings.vaultSyncRemoteFolder) + dirPath;
-        const response = await this.requestUrl({
-          url: this.buildUploadUrl(remoteDir),
-          method: "DELETE",
-          headers: { Authorization: this.buildAuthHeader() },
-        });
-        if ([200, 202, 204].includes(response.status)) {
-          stats.deletedRemote += 1;
-        } else if (![404, 405, 409].includes(response.status)) {
-          // Unexpected error → keep tracking to retry next sync
-          newSyncedDirs.add(dirPath);
-        }
-      } else {
-        // New remote directory not yet local → create locally
-        if (!(await this.app.vault.adapter.exists(dirPath))) {
-          try {
-            await this.app.vault.adapter.mkdir(dirPath);
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            if (!msg.includes("already exists")) {
-              throw e;
-            }
+    // Remote-only directories are kept remotely and recreated locally if needed.
+    for (const dirPath of [...remoteOnly].sort((a, b) => a.length - b.length)) {
+      if (!(await this.app.vault.adapter.exists(dirPath))) {
+        try {
+          await this.app.vault.adapter.mkdir(dirPath);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (!msg.includes("already exists")) {
+            throw e;
           }
         }
-        stats.createdLocal += 1;
-        newSyncedDirs.add(dirPath);
       }
+      stats.createdLocal += 1;
+      newSyncedDirs.add(dirPath);
     }
 
     this.syncedDirectories = newSyncedDirs;
@@ -3240,8 +3235,8 @@ class SecureWebdavSettingTab extends PluginSettingTab {
       .setName(this.plugin.t("同步状态", "Sync status"))
       .setDesc(
         this.plugin.t(
-          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步只处理本机变更队列；完整对账会扫描本地与远端差异并清理远端冗余内容。图片上传仍由独立队列处理。", "Note: Fast sync only processes locally changed paths. Full reconcile scans local and remote differences and cleans extra remote content. Image uploads continue to be handled by the separate queue.")}`,
-          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步只处理本机变更队列；完整对账会扫描本地与远端差异并清理远端冗余内容。图片上传仍由独立队列处理。", "Note: Fast sync only processes locally changed paths. Full reconcile scans local and remote differences and cleans extra remote content. Image uploads continue to be handled by the separate queue.")}`,
+          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步会扫描本地新增/修改文件，并只处理明确删除队列；完整对账会扫描本地与远端差异，但默认保留冲突和缺失项，不再按缺失直接删除。图片上传仍由独立队列处理。", "Note: Fast sync scans local additions/edits and only processes explicit deletion queues. Full reconcile scans local and remote differences, but preserves conflicts and missing items by default instead of deleting solely because one side is missing. Image uploads continue to be handled by the separate queue.")}`,
+          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步会扫描本地新增/修改文件，并只处理明确删除队列；完整对账会扫描本地与远端差异，但默认保留冲突和缺失项，不再按缺失直接删除。图片上传仍由独立队列处理。", "Note: Fast sync scans local additions/edits and only processes explicit deletion queues. Full reconcile scans local and remote differences, but preserves conflicts and missing items by default instead of deleting solely because one side is missing. Image uploads continue to be handled by the separate queue.")}`,
         ),
       )
       .addButton((button) =>
