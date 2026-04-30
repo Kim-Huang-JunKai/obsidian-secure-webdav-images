@@ -456,7 +456,7 @@ async function testFreshLocalEditWinsOverTombstone() {
   assert.equal(plugin.syncIndex.get(file.path)?.remotePath, remotePath, "sync index should keep the note mapped to the same remote path");
 }
 
-async function testMissingRemoteDeletesUnchangedTrackedLocalFile() {
+async function testMissingRemotePreservesUnchangedTrackedLocalFile() {
   const uploadedPaths = [];
   const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
 
@@ -484,9 +484,36 @@ async function testMissingRemoteDeletesUnchangedTrackedLocalFile() {
 
   await plugin.syncConfiguredVaultContent(false);
 
-  assert.equal(app.vault.getAbstractFileByPath(file.path), null, "unchanged stale local copy should be deleted when remote is missing");
-  assert.deepEqual(uploadedPaths, [], "unchanged stale local copy should not be re-uploaded");
-  assert.equal(plugin.syncIndex.has(file.path), false, "sync index should drop the stale local copy");
+  assert.ok(app.vault.getAbstractFileByPath(file.path), "missing remote should not delete unchanged local content without a tombstone");
+  assert.deepEqual(uploadedPaths, [], "unchanged local copy should not be re-uploaded when remote is missing");
+  assert.equal(plugin.syncIndex.has(file.path), true, "sync index should keep the preserved local copy");
+}
+
+async function testMissingRemoteUploadsNewLocalFileAfterLastSync() {
+  const uploadedPaths = [];
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  plugin.lastVaultSyncAt = 1000;
+  const file = app.vault.addFile("Archive/new.md", "new body", { mtime: 10000 });
+  const remotePath = plugin.syncSupport.buildVaultSyncRemotePath(file.path);
+
+  plugin.listRemoteTree = async () => ({
+    files: new Map(),
+    directories: new Set([plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder)]),
+  });
+  plugin.readDeletionTombstones = async () => new Map();
+  plugin.uploadContentFileToRemote = async (incomingFile, incomingRemotePath, markdownContent) => {
+    uploadedPaths.push(incomingRemotePath);
+    return createRemoteFileState(incomingRemotePath, markdownContent ?? incomingFile.content ?? "", incomingFile.stat.mtime);
+  };
+  plugin.reconcileDirectories = async () => ({ createdLocal: 0, createdRemote: 0, deletedLocal: 0, deletedRemote: 0 });
+  plugin.reconcileRemoteImages = async () => ({ deletedFiles: 0, deletedDirectories: 0 });
+  plugin.evictStaleSyncedNotes = async () => 0;
+
+  await plugin.syncConfiguredVaultContent(false);
+
+  assert.deepEqual(uploadedPaths, [remotePath], "new local file created after the last sync should upload");
+  assert.equal(plugin.syncIndex.get(file.path)?.remotePath, remotePath, "sync index should track the uploaded new file");
 }
 
 async function testTombstoneDeletesOldLocalWithoutSyncIndex() {
@@ -555,14 +582,22 @@ async function testTombstonePreservesOlderLocalConflict() {
   assert.deepEqual(uploadedPaths, [], "older local conflict should not overwrite the tombstone");
 }
 
-async function testFastSyncUploadsOnlyPendingPaths() {
+async function testFastSyncUploadsPendingAndScannedLocalChanges() {
   const uploadedPaths = [];
   const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
 
   const changedFile = app.vault.addFile("Notes/changed.md", "changed", { mtime: 5000 });
-  app.vault.addFile("Notes/unchanged.md", "unchanged", { mtime: 5000 });
+  const scannedFile = app.vault.addFile("Notes/scanned.md", "scanned", { mtime: 5000 });
+  const unchangedFile = app.vault.addFile("Notes/unchanged.md", "unchanged", { mtime: 5000 });
   const changedRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(changedFile.path);
+  const scannedRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(scannedFile.path);
+  const unchangedRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(unchangedFile.path);
 
+  plugin.syncIndex.set(unchangedFile.path, {
+    localSignature: await plugin.buildCurrentLocalSignature(unchangedFile, "unchanged"),
+    remoteSignature: "unchanged-remote",
+    remotePath: unchangedRemotePath,
+  });
   plugin.pendingVaultSyncPaths.add(changedFile.path);
   plugin.uploadContentFileToRemote = async (file, remotePath, markdownContent) => {
     uploadedPaths.push(remotePath);
@@ -572,10 +607,26 @@ async function testFastSyncUploadsOnlyPendingPaths() {
 
   await plugin.syncPendingVaultContent(false);
 
-  assert.deepEqual(uploadedPaths, [changedRemotePath], "fast sync should upload only queued files");
+  assert.deepEqual(uploadedPaths.sort(), [changedRemotePath, scannedRemotePath].sort(), "fast sync should upload queued files and scanned local changes");
   assert.equal(plugin.pendingVaultSyncPaths.size, 0, "successful fast sync should clear uploaded paths");
   assert.equal(plugin.syncIndex.get(changedFile.path)?.remotePath, changedRemotePath, "fast sync should refresh the sync index");
+  assert.equal(plugin.syncIndex.get(scannedFile.path)?.remotePath, scannedRemotePath, "fast sync should track scanned local changes");
   assert.ok(/快速同步|Fast sync/.test(plugin.lastVaultSyncStatus), "fast sync should leave a fast-sync status");
+}
+
+async function testFastSyncDoesNotConvertMissingUploadToDeletion() {
+  const deletedPaths = [];
+  const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  plugin.pendingVaultSyncPaths.add("Notes/missing.md");
+  plugin.deleteRemoteContentFile = async (remotePath) => {
+    deletedPaths.push(remotePath);
+  };
+
+  await plugin.syncPendingVaultContent(false);
+
+  assert.deepEqual(deletedPaths, [], "missing pending upload should not become a remote deletion");
+  assert.equal(plugin.pendingVaultDeletionPaths.size, 0, "missing pending upload should not create a deletion tombstone");
 }
 
 async function testFastSyncDeletesPendingRemote() {
@@ -617,7 +668,7 @@ async function testFastSyncSkipsExcludedPaths() {
   assert.equal(plugin.pendingVaultSyncPaths.size, 0, "excluded queued paths should be discarded");
 }
 
-async function testReconcileDirectoriesDeletesLocalEmptyDir() {
+async function testReconcileDirectoriesPreservesLocalEmptyDir() {
   const mkcolCalls = [];
   const deleteCalls = [];
   const { plugin, app } = createHarness(async (options) => {
@@ -631,8 +682,9 @@ async function testReconcileDirectoriesDeletesLocalEmptyDir() {
 
   const stats = await plugin.reconcileDirectories(new Set());
 
-  assert.equal(stats.deletedLocal, 1, "should delete 1 local empty dir");
-  assert.ok(!app.vault.folders.has("Archive"), "Archive folder should be removed locally");
+  assert.equal(stats.deletedLocal, 0, "directory reconcile should not delete local dirs");
+  assert.ok(app.vault.folders.has("Archive"), "Archive folder should remain locally");
+  assert.ok(mkcolCalls.length > 0, "local-only dir should be recreated remotely");
 }
 
 async function testReconcileDirectoriesCreatesRemoteDir() {
@@ -651,7 +703,7 @@ async function testReconcileDirectoriesCreatesRemoteDir() {
   assert.ok(mkcolCalls.length > 0, "should call MKCOL");
 }
 
-async function testReconcileDirectoriesDeletesRemoteDir() {
+async function testReconcileDirectoriesPreservesRemoteDir() {
   const deleteCalls = [];
   const { plugin, app } = createHarness(async (options) => {
     const { url, method } = options;
@@ -664,8 +716,10 @@ async function testReconcileDirectoriesDeletesRemoteDir() {
 
   const stats = await plugin.reconcileDirectories(remoteDirs);
 
-  assert.equal(stats.deletedRemote, 1, "should delete 1 remote dir");
-  assert.ok(deleteCalls.some((url) => url.includes("RemovedFolder")), "should DELETE the removed folder");
+  assert.equal(stats.deletedRemote, 0, "directory reconcile should not delete remote dirs");
+  assert.equal(stats.createdLocal, 1, "remote-only dir should be recreated locally");
+  assert.equal(deleteCalls.length, 0, "remote-only dir should not be deleted");
+  assert.ok(app.vault.folders.has("RemovedFolder"), "RemovedFolder should be restored locally");
 }
 
 async function testReconcileDirectoriesCreatesLocalDir() {
@@ -703,15 +757,17 @@ async function run() {
     ["重命名不会恢复旧路径", testRenameDoesNotRestoreOldPath],
     ["墓碑会删除过时本地副本", testDeletionTombstoneDeletesStaleCopy],
     ["本地新修改会覆盖墓碑而不是被误删", testFreshLocalEditWinsOverTombstone],
-    ["完整同步：远端缺失时删除未改动旧本地副本", testMissingRemoteDeletesUnchangedTrackedLocalFile],
+    ["完整同步：远端缺失时保留未改动本地副本", testMissingRemotePreservesUnchangedTrackedLocalFile],
+    ["完整同步：远端缺失时上传上次同步后的新增本地文件", testMissingRemoteUploadsNewLocalFileAfterLastSync],
     ["完整同步：墓碑不会删除没有本地索引的本地正文", testTombstoneDeletesOldLocalWithoutSyncIndex],
     ["完整同步：墓碑遇到更旧本地冲突时保留本地", testTombstonePreservesOlderLocalConflict],
-    ["目录同步：删除远端已删除的本地空目录", testReconcileDirectoriesDeletesLocalEmptyDir],
-    ["快速同步：只上传增量队列文件", testFastSyncUploadsOnlyPendingPaths],
+    ["目录同步：保留远端缺失的本地空目录", testReconcileDirectoriesPreservesLocalEmptyDir],
+    ["快速同步：上传队列文件和扫描到的本地变化", testFastSyncUploadsPendingAndScannedLocalChanges],
+    ["快速同步：缺失的上传队列项不会变成删除", testFastSyncDoesNotConvertMissingUploadToDeletion],
     ["快速同步：删除队列会写墓碑并删除远端", testFastSyncDeletesPendingRemote],
     ["快速同步：默认跳过 kb 目录", testFastSyncSkipsExcludedPaths],
     ["目录同步：新本地目录上传到远端", testReconcileDirectoriesCreatesRemoteDir],
-    ["目录同步：本地已删除目录从远端删除", testReconcileDirectoriesDeletesRemoteDir],
+    ["目录同步：保留本地缺失的远端目录", testReconcileDirectoriesPreservesRemoteDir],
     ["目录同步：远端新目录在本地创建", testReconcileDirectoriesCreatesLocalDir],
     ["目录同步：非空本地目录不会被删除", testReconcileDirectoriesKeepsNonEmptyLocalDir],
   ];
