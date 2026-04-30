@@ -515,8 +515,44 @@ async function testTombstoneDeletesOldLocalWithoutSyncIndex() {
 
   await plugin.syncConfiguredVaultContent(false);
 
-  assert.equal(app.vault.getAbstractFileByPath(file.path), null, "authoritative tombstone should delete old local files even without local sync index");
+  assert.ok(app.vault.getAbstractFileByPath(file.path), "local file without sync index should be preserved instead of deleted");
   assert.deepEqual(uploadedPaths, [], "authoritative tombstone should not be overwritten by old local files");
+}
+
+async function testTombstonePreservesOlderLocalConflict() {
+  const uploadedPaths = [];
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  const file = app.vault.addFile("Archive/conflict.md", "local body", { mtime: 1000 });
+  const remotePath = plugin.syncSupport.buildVaultSyncRemotePath(file.path);
+  const tombstone = {
+    path: file.path,
+    deletedAt: 5000,
+    remoteSignature: "deleted-remote",
+  };
+
+  plugin.syncIndex.set(file.path, {
+    localSignature: "previous-local",
+    remoteSignature: "deleted-remote",
+    remotePath,
+  });
+  plugin.listRemoteTree = async () => ({
+    files: new Map(),
+    directories: new Set([plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder)]),
+  });
+  plugin.readDeletionTombstones = async () => new Map([[file.path, tombstone]]);
+  plugin.uploadContentFileToRemote = async (_file, incomingRemotePath) => {
+    uploadedPaths.push(incomingRemotePath);
+    throw new Error("older local conflict should not be uploaded");
+  };
+  plugin.reconcileDirectories = async () => ({ createdLocal: 0, createdRemote: 0, deletedLocal: 0, deletedRemote: 0 });
+  plugin.reconcileRemoteImages = async () => ({ deletedFiles: 0, deletedDirectories: 0 });
+  plugin.evictStaleSyncedNotes = async () => 0;
+
+  await plugin.syncConfiguredVaultContent(false);
+
+  assert.ok(app.vault.getAbstractFileByPath(file.path), "older local conflict should be kept for manual review");
+  assert.deepEqual(uploadedPaths, [], "older local conflict should not overwrite the tombstone");
 }
 
 async function testFastSyncUploadsOnlyPendingPaths() {
@@ -668,7 +704,8 @@ async function run() {
     ["墓碑会删除过时本地副本", testDeletionTombstoneDeletesStaleCopy],
     ["本地新修改会覆盖墓碑而不是被误删", testFreshLocalEditWinsOverTombstone],
     ["完整同步：远端缺失时删除未改动旧本地副本", testMissingRemoteDeletesUnchangedTrackedLocalFile],
-    ["完整同步：墓碑会删除没有本地索引的旧副本", testTombstoneDeletesOldLocalWithoutSyncIndex],
+    ["完整同步：墓碑不会删除没有本地索引的本地正文", testTombstoneDeletesOldLocalWithoutSyncIndex],
+    ["完整同步：墓碑遇到更旧本地冲突时保留本地", testTombstonePreservesOlderLocalConflict],
     ["目录同步：删除远端已删除的本地空目录", testReconcileDirectoriesDeletesLocalEmptyDir],
     ["快速同步：只上传增量队列文件", testFastSyncUploadsOnlyPendingPaths],
     ["快速同步：删除队列会写墓碑并删除远端", testFastSyncDeletesPendingRemote],
