@@ -1495,6 +1495,66 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     return !this.lastVaultSyncAt || file.stat.mtime > this.lastVaultSyncAt + graceMs;
   }
 
+  private formatConflictTimestamp() {
+    const value = new Date();
+    const pad = (input: number) => String(input).padStart(2, "0");
+    return `${value.getFullYear()}${pad(value.getMonth() + 1)}${pad(value.getDate())}-${pad(value.getHours())}${pad(value.getMinutes())}${pad(value.getSeconds())}`;
+  }
+
+  private buildConflictCopyPath(originalPath: string, label: string) {
+    const normalized = normalizePath(originalPath);
+    const slashIndex = normalized.lastIndexOf("/");
+    const dir = slashIndex >= 0 ? normalized.slice(0, slashIndex + 1) : "";
+    const name = slashIndex >= 0 ? normalized.slice(slashIndex + 1) : normalized;
+    const dotIndex = name.lastIndexOf(".");
+    const stem = dotIndex > 0 ? name.slice(0, dotIndex) : name;
+    const ext = dotIndex > 0 ? name.slice(dotIndex) : "";
+    const suffix = `.sync-conflict-${this.formatConflictTimestamp()}-${label}`;
+    return `${dir}${stem}${suffix}${ext}`;
+  }
+
+  private findExistingConflictCopyPath(originalPath: string) {
+    const normalized = normalizePath(originalPath);
+    const slashIndex = normalized.lastIndexOf("/");
+    const dir = slashIndex >= 0 ? normalized.slice(0, slashIndex + 1) : "";
+    const name = slashIndex >= 0 ? normalized.slice(slashIndex + 1) : normalized;
+    const dotIndex = name.lastIndexOf(".");
+    const stem = dotIndex > 0 ? name.slice(0, dotIndex) : name;
+    const ext = dotIndex > 0 ? name.slice(dotIndex) : "";
+    const prefix = `${dir}${stem}.sync-conflict-`;
+    return this.app.vault.getFiles()
+      .map((file) => file.path)
+      .find((path) => path.startsWith(prefix) && (!ext || path.endsWith(ext))) ?? null;
+  }
+
+  private async createLocalConflictCopy(file: TFile, markdownContent: string | null | undefined, label: string) {
+    const existing = this.findExistingConflictCopyPath(file.path);
+    if (existing) {
+      return existing;
+    }
+
+    let targetPath = this.buildConflictCopyPath(file.path, label);
+    let attempt = 1;
+    while (this.app.vault.getAbstractFileByPath(targetPath)) {
+      const normalized = normalizePath(targetPath);
+      const dotIndex = normalized.lastIndexOf(".");
+      targetPath = dotIndex > 0
+        ? `${normalized.slice(0, dotIndex)}-${attempt}${normalized.slice(dotIndex)}`
+        : `${normalized}-${attempt}`;
+      attempt += 1;
+    }
+
+    await this.ensureLocalParentFolders(targetPath);
+    if (file.extension === "md") {
+      await this.app.vault.create(targetPath, markdownContent ?? await this.readMarkdownContentPreferEditor(file));
+    } else {
+      await this.app.vault.createBinary(targetPath, await this.app.vault.readBinary(file));
+    }
+
+    this.markPendingVaultSync(targetPath);
+    return targetPath;
+  }
+
   private async reconcileLocalFiles(
     remoteFiles: Map<string, RemoteFileState>,
     deletionTombstones: Map<string, DeletionTombstone>,
@@ -1559,6 +1619,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         }
 
         if (!previous || this.syncSupport.shouldDeleteLocalFromTombstone(file, tombstone)) {
+          await this.createLocalConflictCopy(file, markdownContent, "local");
           counts.skipped += 1;
           continue;
         }
@@ -1648,27 +1709,9 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         continue;
       }
 
-      if (this.syncSupport.shouldDownloadRemoteVersion(file.stat.mtime, remote.lastModified)) {
-        await this.downloadRemoteFileToVault(file.path, remote, file);
-        const refreshed = this.getVaultFileByPath(file.path);
-        this.syncIndex.set(file.path, {
-          localSignature: refreshed ? await this.buildCurrentLocalSignature(refreshed) : remoteSignature,
-          remoteSignature,
-          remotePath,
-        });
-        counts.downloadedOrUpdated += 1;
-        continue;
-      }
-
-      const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent ?? undefined);
-      this.syncIndex.set(file.path, {
-        localSignature,
-        remoteSignature: uploadedRemote.signature,
-        remotePath,
-      });
-      remoteFiles.set(remotePath, uploadedRemote);
-      await this.deleteDeletionTombstone(file.path);
-      counts.uploaded += 1;
+      await this.createLocalConflictCopy(file, markdownContent, "local");
+      counts.skipped += 1;
+      continue;
     }
 
     return localRemotePaths;
