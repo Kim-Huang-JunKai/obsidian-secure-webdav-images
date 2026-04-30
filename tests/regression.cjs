@@ -362,6 +362,96 @@ async function testRenameDoesNotRestoreOldPath() {
   assert.ok(remoteStore.has(tombstoneUrl), "tombstone should remain stored in the mock remote");
 }
 
+async function testFullSyncRenameDoesNotRestoreOldPath() {
+  const remoteStore = new Map();
+  const { plugin, app } = createHarness(async (options) => {
+    const { url, method, body } = options;
+
+    if (method === "PUT") {
+      remoteStore.set(url, { body: body ? body.slice(0) : new ArrayBuffer(0) });
+      return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+    }
+
+    if (method === "DELETE") {
+      remoteStore.delete(url);
+      return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+    }
+
+    if (method === "GET") {
+      const record = remoteStore.get(url);
+      if (!record) {
+        return { status: 404, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+      }
+
+      return { status: 200, headers: {}, arrayBuffer: record.body };
+    }
+
+    return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+
+  const oldPath = "Notes/old-folder.md";
+  const newPath = "Notes/NewGroup/new-folder.md";
+  const newFile = app.vault.addFile(newPath, "fresh content", { mtime: 2000 });
+  await app.vault.createFolder("Notes");
+  await app.vault.createFolder("Notes/NewGroup");
+
+  const oldRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(oldPath);
+  const newRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(newPath);
+  const oldRemoteUrl = plugin.buildUploadUrl(oldRemotePath);
+  remoteStore.set(oldRemoteUrl, { body: new TextEncoder().encode("fresh content").buffer });
+
+  plugin.syncIndex.set(oldPath, {
+    localSignature: "md:old",
+    remoteSignature: "sig-old",
+    remotePath: oldRemotePath,
+  });
+  plugin.listRemoteTree = async () => {
+    const files = new Map();
+    if (remoteStore.has(oldRemoteUrl)) {
+      files.set(oldRemotePath, {
+        remotePath: oldRemotePath,
+        lastModified: 1000,
+        size: 13,
+        signature: "sig-old",
+      });
+    }
+    return {
+      files,
+      directories: new Set([plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder)]),
+    };
+  };
+  plugin.readDeletionTombstones = async () => new Map();
+  plugin.reconcileDirectories = async () => ({ createdLocal: 0, createdRemote: 0, deletedLocal: 0, deletedRemote: 0 });
+  plugin.reconcileRemoteImages = async () => ({ deletedFiles: 0, deletedDirectories: 0 });
+  plugin.evictStaleSyncedNotes = async () => 0;
+  plugin.uploadContentFileToRemote = async (incomingFile, incomingRemotePath, markdownContent) => {
+    const content = markdownContent ?? (await plugin.readMarkdownContentPreferEditor(incomingFile));
+    remoteStore.set(plugin.buildUploadUrl(incomingRemotePath), {
+      body: new TextEncoder().encode(content).buffer,
+    });
+    return createRemoteFileState(incomingRemotePath, content, incomingFile.stat.mtime);
+  };
+
+  await plugin.handleVaultRename(newFile, oldPath);
+
+  const downloadedPaths = [];
+  plugin.downloadRemoteFileToVault = async (vaultPath) => {
+    downloadedPaths.push(vaultPath);
+    if (vaultPath === oldPath) {
+      throw new Error("old path should not be restored during full sync");
+    }
+  };
+
+  await plugin.syncConfiguredVaultContent(false);
+
+  assert.ok(!downloadedPaths.includes(oldPath), "full sync should not redownload the renamed old path");
+  assert.equal(app.vault.getAbstractFileByPath(oldPath), null, "renamed old path should remain absent locally");
+  assert.ok(app.vault.getAbstractFileByPath(newPath), "renamed new path should stay in place locally");
+  assert.ok(remoteStore.has(plugin.buildUploadUrl(newRemotePath)), "full sync should upload the renamed file to its new remote path");
+  assert.ok(remoteStore.has(plugin.buildUploadUrl(plugin.syncSupport.buildDeletionRemotePath(oldPath))), "full sync should write a tombstone for the renamed old path");
+  assert.ok(!remoteStore.has(oldRemoteUrl), "full sync should delete the old remote path before reconciliation");
+}
+
 async function testDeletionTombstoneDeletesStaleCopy() {
   const deletedPaths = [];
   const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
@@ -848,6 +938,7 @@ async function run() {
     ["上传永久失败会清空队列并替换失败占位", testPermanentUploadFailureRewritesPlaceholder],
     ["懒加载占位不会上传成正文", testLazyStubRefusesUpload],
     ["重命名不会恢复旧路径", testRenameDoesNotRestoreOldPath],
+    ["完整同步：重命名后不会把旧路径重新下载回来", testFullSyncRenameDoesNotRestoreOldPath],
     ["墓碑会删除过时本地副本", testDeletionTombstoneDeletesStaleCopy],
     ["本地新修改会覆盖墓碑而不是被误删", testFreshLocalEditWinsOverTombstone],
     ["完整同步：远端缺失时保留未改动本地副本", testMissingRemotePreservesUnchangedTrackedLocalFile],

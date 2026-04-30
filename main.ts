@@ -1223,9 +1223,6 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
       await this.rebuildReferenceIndex();
 
-      const remoteInventory = await this.listRemoteTree(this.settings.vaultSyncRemoteFolder);
-      const deletionTombstones = await this.readDeletionTombstones();
-      const remoteFiles = remoteInventory.files;
       const counts = {
         uploaded: 0, restoredFromRemote: 0, downloadedOrUpdated: 0, skipped: 0,
         deletedRemoteFiles: 0, deletedLocalFiles: 0, deletedLocalStubs: 0,
@@ -1234,6 +1231,15 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         deletedLocalDirectories: 0, createdLocalDirectories: 0,
         evictedNotes: 0,
       };
+
+      // Explicit local deletes/renames must land on the remote side before we
+      // inspect remote-only entries, otherwise a just-moved note can be pulled
+      // back from its old remote path and appear as a duplicate local file.
+      await this.processPendingVaultDeletions(counts);
+
+      const remoteInventory = await this.listRemoteTree(this.settings.vaultSyncRemoteFolder);
+      const deletionTombstones = await this.readDeletionTombstones();
+      const remoteFiles = remoteInventory.files;
 
       await this.reconcileOrphanedSyncEntries(remoteFiles, deletionTombstones, counts);
       await this.reconcileRemoteOnlyFiles(remoteFiles, deletionTombstones, counts);
