@@ -443,7 +443,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
 
     this.autoSyncTickInProgress = true;
     try {
-      await this.syncPendingVaultContent(false);
+      await this.syncConfiguredVaultContent(false);
     } finally {
       this.autoSyncTickInProgress = false;
     }
@@ -3220,8 +3220,8 @@ class SecureWebdavSettingTab extends PluginSettingTab {
       .setName(this.plugin.t("自动同步频率", "Auto sync frequency"))
       .setDesc(
         this.plugin.t(
-          "以分钟为单位设置自动同步时间。填 0 表示关闭自动同步。这里的同步是“对账同步”：会检查本地与远端目录差异，补传新增和变更文件，并删除远端多余内容。",
-          "Set the automatic sync interval in minutes. Use 0 to turn it off. This is a reconciliation sync: it checks local and remote differences, uploads new or changed files, and removes extra remote content.",
+          "以分钟为单位设置自动同步时间。填 0 表示关闭自动同步。这里的自动同步执行“完整同步”：会检查本地与远端差异，上传本地变更，并拉取远端更新。",
+          "Set the automatic sync interval in minutes. Use 0 to turn it off. Auto sync runs the full sync flow: it checks local and remote differences, uploads local changes, and pulls remote updates.",
         ),
       )
       .addText((text) =>
@@ -3281,8 +3281,8 @@ class SecureWebdavSettingTab extends PluginSettingTab {
       .setName(this.plugin.t("同步状态", "Sync status"))
       .setDesc(
         this.plugin.t(
-          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步会扫描本地新增/修改文件，并只处理明确删除队列；完整对账会扫描本地与远端差异，但默认保留冲突和缺失项，不再按缺失直接删除。图片上传仍由独立队列处理。", "Note: Fast sync scans local additions/edits and only processes explicit deletion queues. Full reconcile scans local and remote differences, but preserves conflicts and missing items by default instead of deleting solely because one side is missing. Image uploads continue to be handled by the separate queue.")}`,
-          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步会扫描本地新增/修改文件，并只处理明确删除队列；完整对账会扫描本地与远端差异，但默认保留冲突和缺失项，不再按缺失直接删除。图片上传仍由独立队列处理。", "Note: Fast sync scans local additions/edits and only processes explicit deletion queues. Full reconcile scans local and remote differences, but preserves conflicts and missing items by default instead of deleting solely because one side is missing. Image uploads continue to be handled by the separate queue.")}`,
+          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步只负责上传本地新增/修改文件，并处理明确删除队列；完整同步才会同时上传本地变更并下载远端更新。图片上传仍由独立队列处理。", "Note: Fast sync only uploads local additions/edits and processes explicit deletion queues. Full sync is the mode that both uploads local changes and downloads remote updates. Image uploads continue to be handled by the separate queue.")}`,
+          `${this.plugin.formatLastSyncLabel()}\n${this.plugin.formatSyncStatusLabel()}\n${this.plugin.t("说明：快速同步只负责上传本地新增/修改文件，并处理明确删除队列；完整同步才会同时上传本地变更并下载远端更新。图片上传仍由独立队列处理。", "Note: Fast sync only uploads local additions/edits and processes explicit deletion queues. Full sync is the mode that both uploads local changes and downloads remote updates. Image uploads continue to be handled by the separate queue.")}`,
         ),
       )
       .addButton((button) =>

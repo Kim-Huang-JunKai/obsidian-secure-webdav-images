@@ -745,6 +745,22 @@ async function testFastSyncSkipsExcludedPaths() {
   assert.equal(plugin.pendingVaultSyncPaths.size, 0, "excluded queued paths should be discarded");
 }
 
+async function testAutoSyncUsesFullSync() {
+  const { plugin } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+  const calls = [];
+
+  plugin.syncPendingVaultContent = async () => {
+    calls.push("fast");
+  };
+  plugin.syncConfiguredVaultContent = async () => {
+    calls.push("full");
+  };
+
+  await plugin.runAutoSyncTick();
+
+  assert.deepEqual(calls, ["full"], "auto sync should run full sync instead of fast sync");
+}
+
 async function testReconcileDirectoriesPreservesLocalEmptyDir() {
   const mkcolCalls = [];
   const deleteCalls = [];
@@ -845,6 +861,7 @@ async function run() {
     ["快速同步：缺失的上传队列项不会变成删除", testFastSyncDoesNotConvertMissingUploadToDeletion],
     ["快速同步：删除队列会写墓碑并删除远端", testFastSyncDeletesPendingRemote],
     ["快速同步：默认跳过 kb 目录", testFastSyncSkipsExcludedPaths],
+    ["自动同步：执行完整同步而不是快速同步", testAutoSyncUsesFullSync],
     ["目录同步：新本地目录上传到远端", testReconcileDirectoriesCreatesRemoteDir],
     ["目录同步：保留本地缺失的远端目录", testReconcileDirectoriesPreservesRemoteDir],
     ["目录同步：远端新目录在本地创建", testReconcileDirectoriesCreatesLocalDir],
