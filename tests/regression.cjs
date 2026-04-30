@@ -544,6 +544,10 @@ async function testTombstoneDeletesOldLocalWithoutSyncIndex() {
 
   assert.ok(app.vault.getAbstractFileByPath(file.path), "local file without sync index should be preserved instead of deleted");
   assert.deepEqual(uploadedPaths, [], "authoritative tombstone should not be overwritten by old local files");
+  assert.ok(
+    app.vault.getFiles().some((entry) => entry.path.startsWith("Archive/tombstoned.sync-conflict-") && entry.path.endsWith(".md")),
+    "tombstone conflict should create a local conflict copy",
+  );
 }
 
 async function testTombstonePreservesOlderLocalConflict() {
@@ -580,6 +584,52 @@ async function testTombstonePreservesOlderLocalConflict() {
 
   assert.ok(app.vault.getAbstractFileByPath(file.path), "older local conflict should be kept for manual review");
   assert.deepEqual(uploadedPaths, [], "older local conflict should not overwrite the tombstone");
+  assert.ok(
+    app.vault.getFiles().some((entry) => entry.path.startsWith("Archive/conflict.sync-conflict-") && entry.path.endsWith(".md")),
+    "older local tombstone conflict should create a conflict copy",
+  );
+}
+
+async function testBothSidesChangedCreatesConflictCopy() {
+  const uploadedPaths = [];
+  const downloadedPaths = [];
+  const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
+
+  const file = app.vault.addFile("Notes/both.md", "local edit", { mtime: 5000 });
+  const remotePath = plugin.syncSupport.buildVaultSyncRemotePath(file.path);
+  const remoteState = createRemoteFileState(remotePath, "remote edit", 6000);
+
+  plugin.syncIndex.set(file.path, {
+    localSignature: "md:old",
+    remoteSignature: "remote-old",
+    remotePath,
+  });
+  plugin.listRemoteTree = async () => ({
+    files: new Map([[remotePath, remoteState]]),
+    directories: new Set([plugin.normalizeFolder(plugin.settings.vaultSyncRemoteFolder)]),
+  });
+  plugin.readDeletionTombstones = async () => new Map();
+  plugin.uploadContentFileToRemote = async (_file, incomingRemotePath) => {
+    uploadedPaths.push(incomingRemotePath);
+    throw new Error("both-sided conflict should not upload over remote");
+  };
+  plugin.downloadRemoteFileToVault = async (vaultPath) => {
+    downloadedPaths.push(vaultPath);
+    throw new Error("both-sided conflict should not overwrite local");
+  };
+  plugin.reconcileDirectories = async () => ({ createdLocal: 0, createdRemote: 0, deletedLocal: 0, deletedRemote: 0 });
+  plugin.reconcileRemoteImages = async () => ({ deletedFiles: 0, deletedDirectories: 0 });
+  plugin.evictStaleSyncedNotes = async () => 0;
+
+  await plugin.syncConfiguredVaultContent(false);
+
+  assert.equal(app.vault.getAbstractFileByPath(file.path)?.content, "local edit", "local edit should stay in place");
+  assert.deepEqual(uploadedPaths, [], "both-sided conflict should not upload");
+  assert.deepEqual(downloadedPaths, [], "both-sided conflict should not download over local");
+  assert.ok(
+    app.vault.getFiles().some((entry) => entry.path.startsWith("Notes/both.sync-conflict-") && entry.path.endsWith(".md")),
+    "both-sided conflict should create a local conflict copy",
+  );
 }
 
 async function testFastSyncUploadsPendingAndScannedLocalChanges() {
@@ -761,6 +811,7 @@ async function run() {
     ["完整同步：远端缺失时上传上次同步后的新增本地文件", testMissingRemoteUploadsNewLocalFileAfterLastSync],
     ["完整同步：墓碑不会删除没有本地索引的本地正文", testTombstoneDeletesOldLocalWithoutSyncIndex],
     ["完整同步：墓碑遇到更旧本地冲突时保留本地", testTombstonePreservesOlderLocalConflict],
+    ["完整同步：本地和远端同时变化时创建冲突副本", testBothSidesChangedCreatesConflictCopy],
     ["目录同步：保留远端缺失的本地空目录", testReconcileDirectoriesPreservesLocalEmptyDir],
     ["快速同步：上传队列文件和扫描到的本地变化", testFastSyncUploadsPendingAndScannedLocalChanges],
     ["快速同步：缺失的上传队列项不会变成删除", testFastSyncDoesNotConvertMissingUploadToDeletion],
