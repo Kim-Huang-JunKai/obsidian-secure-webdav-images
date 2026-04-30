@@ -68,6 +68,14 @@ type PendingDeletionEntry = {
   remoteSignature?: string;
 };
 
+type PendingRenameEntry = {
+  oldPath: string;
+  newPath: string;
+  oldRemotePath: string;
+  oldRemoteSignature?: string;
+  recordedAt: number;
+};
+
 type RemoteInventory = {
   files: Map<string, RemoteFileState>;
   directories: Set<string>;
@@ -126,9 +134,12 @@ export default class SecureWebdavImagesPlugin extends Plugin {
   private missingLazyRemoteNotes = new Map<string, MissingLazyRemoteRecord>();
   private pendingVaultSyncPaths = new Set<string>();
   private pendingVaultDeletionPaths = new Map<string, PendingDeletionEntry>();
+  private pendingVaultRenamePaths = new Map<string, PendingRenameEntry>();
   private pendingVaultMutationPromises = new Set<Promise<void>>();
   private priorityNoteSyncTimeouts = new Map<string, number>();
   private priorityNoteSyncsInFlight = new Set<string>();
+  private priorityRenameSyncTimeouts = new Map<string, number>();
+  private priorityRenameSyncsInFlight = new Set<string>();
   private lastVaultSyncAt = 0;
   private lastVaultSyncStatus = "";
   private syncInProgress = false;
@@ -299,6 +310,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         window.clearTimeout(timeoutId);
       }
       this.priorityNoteSyncTimeouts.clear();
+      for (const timeoutId of this.priorityRenameSyncTimeouts.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      this.priorityRenameSyncTimeouts.clear();
       this.uploadQueue.dispose();
     });
   }
@@ -313,6 +328,10 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       window.clearTimeout(timeoutId);
     }
     this.priorityNoteSyncTimeouts.clear();
+    for (const timeoutId of this.priorityRenameSyncTimeouts.values()) {
+      window.clearTimeout(timeoutId);
+    }
+    this.priorityRenameSyncTimeouts.clear();
   }
 
   async loadPluginState() {
@@ -326,6 +345,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       this.missingLazyRemoteNotes = new Map();
       this.pendingVaultSyncPaths = new Set();
       this.pendingVaultDeletionPaths = new Map();
+      this.pendingVaultRenamePaths = new Map();
       return;
     }
 
@@ -368,6 +388,29 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         const remoteSignature = typeof entry.remoteSignature === "string" ? entry.remoteSignature : undefined;
         this.pendingVaultDeletionPaths.set(path, { remotePath, remoteSignature });
       }
+      this.pendingVaultRenamePaths = new Map();
+      for (const [oldPath, rawEntry] of Object.entries((candidate.pendingVaultRenamePaths as Record<string, unknown> | undefined) ?? {})) {
+        if (!rawEntry || typeof rawEntry !== "object") {
+          continue;
+        }
+        const entry = rawEntry as Record<string, unknown>;
+        const newPath = typeof entry.newPath === "string" ? entry.newPath : "";
+        if (!newPath) {
+          continue;
+        }
+        const oldRemotePath = typeof entry.oldRemotePath === "string" && entry.oldRemotePath.length > 0
+          ? entry.oldRemotePath
+          : `${this.normalizeFolder(this.settings.vaultSyncRemoteFolder)}${oldPath}`;
+        const oldRemoteSignature = typeof entry.oldRemoteSignature === "string" ? entry.oldRemoteSignature : undefined;
+        const recordedAt = typeof entry.recordedAt === "number" ? entry.recordedAt : Date.now();
+        this.pendingVaultRenamePaths.set(oldPath, {
+          oldPath,
+          newPath,
+          oldRemotePath,
+          oldRemoteSignature,
+          recordedAt,
+        });
+      }
       this.syncIndex = new Map();
       for (const [path, rawEntry] of Object.entries((candidate.syncIndex as Record<string, unknown> | undefined) ?? {})) {
         const normalized = this.normalizeSyncIndexEntry(path, rawEntry);
@@ -394,6 +437,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     this.missingLazyRemoteNotes = new Map();
     this.pendingVaultSyncPaths = new Set();
     this.pendingVaultDeletionPaths = new Map();
+    this.pendingVaultRenamePaths = new Map();
     this.lastVaultSyncAt = 0;
     this.lastVaultSyncStatus = "";
     this.normalizeEffectiveSettings();
@@ -457,6 +501,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       missingLazyRemoteNotes: Object.fromEntries(this.missingLazyRemoteNotes.entries()),
       pendingVaultSyncPaths: [...this.pendingVaultSyncPaths],
       pendingVaultDeletionPaths: Object.fromEntries(this.pendingVaultDeletionPaths.entries()),
+      pendingVaultRenamePaths: Object.fromEntries(this.pendingVaultRenamePaths.entries()),
       syncIndex: Object.fromEntries(this.syncIndex.entries()),
       syncedDirectories: [...this.syncedDirectories],
       lastVaultSyncAt: this.lastVaultSyncAt,
@@ -593,9 +638,11 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     if (!this.syncSupport.shouldSkipContentSyncPath(oldPath)) {
+      const trackedOldPath = this.recordPendingVaultRename(oldPath, file.path);
       this.markPendingVaultDeletion(oldPath);
       this.syncIndex.delete(oldPath);
       await this.savePluginState();
+      this.schedulePriorityRenameSync(trackedOldPath);
     }
 
     if (!this.syncSupport.shouldSkipContentSyncPath(file.path)) {
@@ -639,6 +686,35 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       remotePath: existing?.remotePath ?? this.syncSupport.buildVaultSyncRemotePath(path),
       remoteSignature: existing?.remoteSignature,
     });
+  }
+
+  private findPendingVaultRenameByNewPath(newPath: string) {
+    return [...this.pendingVaultRenamePaths.values()].find((entry) => entry.newPath === newPath) ?? null;
+  }
+
+  private recordPendingVaultRename(oldPath: string, newPath: string) {
+    const normalizedOldPath = normalizePath(oldPath);
+    const normalizedNewPath = normalizePath(newPath);
+    const existing = this.findPendingVaultRenameByNewPath(normalizedOldPath);
+    const previous = existing ?? this.pendingVaultRenamePaths.get(normalizedOldPath) ?? null;
+    if (existing) {
+      this.pendingVaultRenamePaths.delete(existing.oldPath);
+    }
+
+    const indexed = this.syncIndex.get(normalizedOldPath);
+    const trackedOldPath = previous?.oldPath ?? normalizedOldPath;
+    const oldRemotePath = previous?.oldRemotePath ?? indexed?.remotePath ?? this.syncSupport.buildVaultSyncRemotePath(normalizedOldPath);
+    const oldRemoteSignature = previous?.oldRemoteSignature ?? indexed?.remoteSignature;
+    const recordedAt = previous?.recordedAt ?? Date.now();
+
+    this.pendingVaultRenamePaths.set(trackedOldPath, {
+      oldPath: trackedOldPath,
+      newPath: normalizedNewPath,
+      oldRemotePath,
+      oldRemoteSignature,
+      recordedAt,
+    });
+    return trackedOldPath;
   }
 
   private extractRemotePathsFromText(content: string) {
@@ -742,6 +818,65 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       this.schedulePriorityNoteSync(notePath, reason);
     } finally {
       this.priorityNoteSyncsInFlight.delete(notePath);
+    }
+  }
+
+  private schedulePriorityRenameSync(oldPath: string) {
+    const existing = this.priorityRenameSyncTimeouts.get(oldPath);
+    if (existing) {
+      window.clearTimeout(existing);
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      this.priorityRenameSyncTimeouts.delete(oldPath);
+      void this.flushPriorityRenameSync(oldPath);
+    }, 700);
+    this.priorityRenameSyncTimeouts.set(oldPath, timeoutId);
+  }
+
+  private async flushPriorityRenameSync(oldPath: string) {
+    if (this.priorityRenameSyncsInFlight.has(oldPath)) {
+      return;
+    }
+
+    if (
+      this.pendingVaultMutationPromises.size > 0 ||
+      this.uploadQueue.hasPendingWork() ||
+      this.syncInProgress ||
+      this.autoSyncTickInProgress
+    ) {
+      this.schedulePriorityRenameSync(oldPath);
+      return;
+    }
+
+    if (!this.pendingVaultRenamePaths.has(oldPath)) {
+      return;
+    }
+
+    this.priorityRenameSyncsInFlight.add(oldPath);
+    const counts = { uploaded: 0, deletedRemoteFiles: 0, skipped: 0 };
+    try {
+      this.ensureConfigured();
+      await this.processPendingVaultRenames(counts, [oldPath]);
+      if (counts.uploaded > 0 || counts.deletedRemoteFiles > 0) {
+        this.lastVaultSyncAt = Date.now();
+        this.lastVaultSyncStatus = this.t(
+          `已优先同步重命名/移动：上传 ${counts.uploaded} 个文件，删除远端旧路径 ${counts.deletedRemoteFiles} 个。`,
+          `Prioritized rename/move sync uploaded ${counts.uploaded} file(s) and deleted ${counts.deletedRemoteFiles} stale remote path(s).`,
+        );
+        await this.savePluginState();
+      }
+    } catch (error) {
+      console.error("Priority rename sync failed", error);
+      this.lastVaultSyncAt = Date.now();
+      this.lastVaultSyncStatus = this.describeError(
+        this.t("重命名/移动后的优先同步失败", "Priority sync after rename/move failed"),
+        error,
+      );
+      await this.savePluginState();
+      this.schedulePriorityRenameSync(oldPath);
+    } finally {
+      this.priorityRenameSyncsInFlight.delete(oldPath);
     }
   }
 
@@ -1235,6 +1370,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       // Explicit local deletes/renames must land on the remote side before we
       // inspect remote-only entries, otherwise a just-moved note can be pulled
       // back from its old remote path and appear as a duplicate local file.
+      await this.processPendingVaultRenames(counts);
       await this.processPendingVaultDeletions(counts);
 
       const remoteInventory = await this.listRemoteTree(this.settings.vaultSyncRemoteFolder);
@@ -1295,6 +1431,7 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         return;
       }
 
+      await this.processPendingVaultRenames(counts);
       await this.queueChangedLocalFilesForFastSync(counts);
       await this.processPendingVaultDeletions(counts);
       await this.processPendingVaultUploads(counts);
@@ -1342,6 +1479,69 @@ export default class SecureWebdavImagesPlugin extends Plugin {
         }
         this.markPendingVaultSync(file.path);
       }
+    }
+  }
+
+  private async processPendingVaultRenames(
+    counts: { uploaded: number; deletedRemoteFiles: number; skipped: number },
+    targetOldPaths?: string[],
+  ) {
+    const requested = targetOldPaths ? new Set(targetOldPaths.map((path) => normalizePath(path))) : null;
+    for (const [oldPath, entry] of [...this.pendingVaultRenamePaths.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      if (requested && !requested.has(oldPath)) {
+        continue;
+      }
+
+      if (this.syncSupport.shouldSkipContentSyncPath(oldPath) || this.syncSupport.shouldSkipContentSyncPath(entry.newPath)) {
+        this.pendingVaultRenamePaths.delete(oldPath);
+        this.pendingVaultDeletionPaths.delete(oldPath);
+        counts.skipped += 1;
+        continue;
+      }
+
+      await this.writeDeletionTombstone(oldPath, entry.oldRemoteSignature);
+      await this.deleteRemoteContentFile(entry.oldRemotePath);
+      this.pendingVaultDeletionPaths.delete(oldPath);
+      this.syncIndex.delete(oldPath);
+      counts.deletedRemoteFiles += 1;
+
+      const file = this.getVaultFileByPath(entry.newPath);
+      if (!(file instanceof TFile)) {
+        this.pendingVaultRenamePaths.delete(oldPath);
+        counts.skipped += 1;
+        continue;
+      }
+
+      const markdownContent = file.extension === "md" ? await this.readMarkdownContentPreferEditor(file) : undefined;
+      if (file.extension === "md" && this.parseNoteStub(markdownContent ?? "")) {
+        this.pendingVaultRenamePaths.delete(oldPath);
+        this.pendingVaultSyncPaths.delete(file.path);
+        counts.skipped += 1;
+        continue;
+      }
+
+      const remotePath = this.syncSupport.buildVaultSyncRemotePath(file.path);
+      const localSignature = await this.buildCurrentLocalSignature(file, markdownContent);
+      let remoteAtNewPath: RemoteFileState | null = null;
+      try {
+        remoteAtNewPath = await this.statRemoteFile(remotePath);
+      } catch {
+        remoteAtNewPath = null;
+      }
+      if (remoteAtNewPath && remoteAtNewPath.signature !== localSignature) {
+        await this.createLocalConflictCopy(file, markdownContent ?? undefined, "local");
+      }
+
+      const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent);
+      this.syncIndex.set(file.path, {
+        localSignature,
+        remoteSignature: uploadedRemote.signature,
+        remotePath,
+      });
+      this.pendingVaultSyncPaths.delete(file.path);
+      this.pendingVaultRenamePaths.delete(oldPath);
+      await this.deleteDeletionTombstone(file.path);
+      counts.uploaded += 1;
     }
   }
 
@@ -1464,6 +1664,11 @@ export default class SecureWebdavImagesPlugin extends Plugin {
       }
 
       if (this.syncSupport.shouldSkipContentSyncPath(vaultPath)) {
+        continue;
+      }
+
+      if (this.pendingVaultRenamePaths.has(vaultPath)) {
+        counts.skipped += 1;
         continue;
       }
 
@@ -1956,7 +2161,12 @@ export default class SecureWebdavImagesPlugin extends Plugin {
     }
 
     await this.uploadBinary(remotePath, binary, this.getMimeType(file.extension));
-    const remote = await this.statRemoteFile(remotePath);
+    let remote: RemoteFileState | null = null;
+    try {
+      remote = await this.statRemoteFile(remotePath);
+    } catch {
+      remote = null;
+    }
     if (remote) {
       return remote;
     }

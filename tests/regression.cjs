@@ -362,6 +362,59 @@ async function testRenameDoesNotRestoreOldPath() {
   assert.ok(remoteStore.has(tombstoneUrl), "tombstone should remain stored in the mock remote");
 }
 
+async function testPriorityRenameSyncPushesMoveImmediately() {
+  const remoteStore = new Map();
+  const { plugin, app } = createHarness(async (options) => {
+    const { url, method, body } = options;
+
+    if (method === "PUT") {
+      remoteStore.set(url, { body: body ? body.slice(0) : new ArrayBuffer(0) });
+      return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+    }
+
+    if (method === "DELETE") {
+      remoteStore.delete(url);
+      return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+    }
+
+    if (method === "GET") {
+      const record = remoteStore.get(url);
+      if (!record) {
+        return { status: 404, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+      }
+
+      return { status: 200, headers: {}, arrayBuffer: record.body };
+    }
+
+    return { status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) };
+  });
+
+  const oldPath = "Notes/old.md";
+  const newPath = "Notes/NewGroup/new.md";
+  const newFile = app.vault.addFile(newPath, "fresh content", { mtime: 2000 });
+  const oldRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(oldPath);
+  const newRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(newPath);
+  remoteStore.set(plugin.buildUploadUrl(oldRemotePath), {
+    body: new TextEncoder().encode("fresh content").buffer,
+  });
+
+  plugin.syncIndex.set(oldPath, {
+    localSignature: "md:old",
+    remoteSignature: "sig-old",
+    remotePath: oldRemotePath,
+  });
+
+  await plugin.handleVaultRename(newFile, oldPath);
+  await plugin.flushPriorityRenameSync(oldPath);
+
+  assert.ok(!remoteStore.has(plugin.buildUploadUrl(oldRemotePath)), "priority rename sync should delete the stale old remote path");
+  assert.ok(remoteStore.has(plugin.buildUploadUrl(newRemotePath)), "priority rename sync should upload the moved file to the new remote path");
+  assert.ok(remoteStore.has(plugin.buildUploadUrl(plugin.syncSupport.buildDeletionRemotePath(oldPath))), "priority rename sync should write a tombstone for the old path");
+  assert.equal(plugin.pendingVaultRenamePaths.size, 0, "priority rename sync should clear the pending rename entry");
+  assert.equal(plugin.pendingVaultDeletionPaths.size, 0, "priority rename sync should consume the stale deletion queue entry");
+  assert.equal(plugin.syncIndex.get(newPath)?.remotePath, newRemotePath, "priority rename sync should refresh the sync index for the new path");
+}
+
 async function testFullSyncRenameDoesNotRestoreOldPath() {
   const remoteStore = new Map();
   const { plugin, app } = createHarness(async (options) => {
@@ -938,6 +991,7 @@ async function run() {
     ["上传永久失败会清空队列并替换失败占位", testPermanentUploadFailureRewritesPlaceholder],
     ["懒加载占位不会上传成正文", testLazyStubRefusesUpload],
     ["重命名不会恢复旧路径", testRenameDoesNotRestoreOldPath],
+    ["重命名：立即优先同步旧路径删除和新路径上传", testPriorityRenameSyncPushesMoveImmediately],
     ["完整同步：重命名后不会把旧路径重新下载回来", testFullSyncRenameDoesNotRestoreOldPath],
     ["墓碑会删除过时本地副本", testDeletionTombstoneDeletesStaleCopy],
     ["本地新修改会覆盖墓碑而不是被误删", testFreshLocalEditWinsOverTombstone],
