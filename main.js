@@ -1947,6 +1947,9 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       const limit = this.settings.fastSyncRecentChangeLimit;
       const remoteEvents = await this.listRecentRemoteSyncEvents(limit);
       await this.replayRemoteSyncEvents(remoteEvents, counts);
+      if (remoteEvents.length === 0) {
+        await this.detectRemoteChangesBySignature(counts);
+      }
       await this.processPendingVaultRenames(counts);
       await this.processPendingVaultDeletions(counts);
       await this.processPendingVaultUploads(counts);
@@ -2269,6 +2272,54 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       } catch (err) {
         console.warn("Failed to replay remote event:", event.id, err);
         counts.skipped += 1;
+      }
+    }
+  }
+  async detectRemoteChangesBySignature(counts) {
+    const pathsToCheck = [...this.syncIndex.keys()].slice(0, this.settings.fastSyncRecentChangeLimit);
+    if (pathsToCheck.length === 0) return;
+    for (const vaultPath of pathsToCheck) {
+      if (this.syncSupport.shouldSkipContentSyncPath(vaultPath)) continue;
+      const entry = this.syncIndex.get(vaultPath);
+      if (!entry || !entry.remotePath) continue;
+      let remoteInfo;
+      try {
+        const resp = await this.requestUrl({
+          url: this.buildUploadUrl(entry.remotePath),
+          method: "HEAD",
+          headers: { Authorization: this.buildAuthHeader() }
+        });
+        if (resp.status === 404) {
+          const localFile = this.getVaultFileByPath(vaultPath);
+          if (localFile && !this.pendingVaultSyncPaths.has(vaultPath)) {
+            const localSig = await this.buildCurrentLocalSignature(localFile);
+            if (localSig === entry.localSignature) {
+              await this.removeLocalVaultFile(localFile);
+              this.syncIndex.delete(vaultPath);
+              counts.deletedRemoteFiles += 1;
+            }
+          }
+          continue;
+        }
+        if (resp.status !== 200) continue;
+        const lastModified = resp.headers["last-modified"] || resp.headers["Last-Modified"] || "";
+        const contentLength = resp.headers["content-length"] || resp.headers["Content-Length"] || "0";
+        const remoteSig = `${new Date(lastModified).getTime() || 0}:${contentLength}`;
+        if (remoteSig === entry.remoteSignature) continue;
+        const localFile = this.getVaultFileByPath(vaultPath);
+        if (localFile) {
+          const localSig = await this.buildCurrentLocalSignature(localFile);
+          if (localSig !== entry.localSignature) continue;
+        }
+        await this.downloadRemoteFileToVault(vaultPath, { remotePath: entry.remotePath }, localFile);
+        const updatedFile = this.getVaultFileByPath(vaultPath);
+        if (updatedFile) {
+          const newLocalSig = await this.buildCurrentLocalSignature(updatedFile);
+          this.syncIndex.set(vaultPath, { remotePath: entry.remotePath, localSignature: newLocalSig, remoteSignature: remoteSig });
+        }
+        counts.downloadedRemote += 1;
+      } catch {
+        continue;
       }
     }
   }
@@ -2650,6 +2701,14 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
   async ensureRemoteEventFolder() {
     const eventFolder = this.syncSupport.buildRemoteEventFolder();
     await this.ensureRemoteDirectories(eventFolder);
+    const response = await this.requestUrl({
+      url: this.buildUploadUrl(eventFolder),
+      method: "MKCOL",
+      headers: { Authorization: this.buildAuthHeader() }
+    });
+    if (![200, 201, 204, 207, 301, 302, 307, 308, 405].includes(response.status)) {
+      throw new Error(`MKCOL event folder failed with status ${response.status}`);
+    }
   }
   async writeRemoteSyncEvent(event) {
     const eventFolder = this.syncSupport.buildRemoteEventFolder();
