@@ -2314,9 +2314,9 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     }
   }
   async detectRemoteChangesBySignature(counts) {
-    const pathsToCheck = [...this.syncIndex.keys()].slice(0, this.settings.fastSyncRecentChangeLimit);
-    if (pathsToCheck.length === 0) return;
-    for (const vaultPath of pathsToCheck) {
+    const allPaths = [...this.syncIndex.keys()];
+    if (allPaths.length === 0) return;
+    for (const vaultPath of allPaths) {
       if (this.syncSupport.shouldSkipContentSyncPath(vaultPath)) continue;
       if (this.pendingVaultSyncPaths.has(vaultPath)) continue;
       const entry = this.syncIndex.get(vaultPath);
