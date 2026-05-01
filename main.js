@@ -473,6 +473,17 @@ var SecureWebdavSyncSupport = class {
   buildRemoteEventFolder() {
     return `${this.normalizeFolder(this.deps.getVaultSyncRemoteFolder()).replace(/\/$/, "")}${this.deps.eventFolderSuffix}`;
   }
+  buildTrashFolder() {
+    return `${this.normalizeFolder(this.deps.getVaultSyncRemoteFolder()).replace(/\/$/, "")}${this.deps.trashFolderSuffix}`;
+  }
+  buildTrashRemotePath(vaultPath) {
+    const ext = vaultPath.lastIndexOf(".");
+    const suffix = ext >= 0 ? vaultPath.substring(ext) : "";
+    return `${this.buildTrashFolder()}${this.deps.encodeBase64Url(vaultPath)}${suffix}`;
+  }
+  buildTrashMetaPath(vaultPath) {
+    return `${this.buildTrashFolder()}${this.deps.encodeBase64Url(vaultPath)}.json`;
+  }
   buildDeletionRemotePath(vaultPath) {
     return `${this.buildDeletionFolder()}${this.deps.encodeBase64Url(vaultPath)}.json`;
   }
@@ -560,7 +571,8 @@ var DEFAULT_SETTINGS = {
   maxImageDimension: 2200,
   jpegQuality: 82,
   fastSyncRecentChangeLimit: 20,
-  autoUpdateCheckIntervalHours: 24
+  autoUpdateCheckIntervalHours: 24,
+  trashRetentionDays: 30
 };
 var MIME_MAP = {
   jpg: "image/jpeg",
@@ -605,6 +617,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     this.autoSyncTickInProgress = false;
     this.deletionFolderSuffix = ".__secure-webdav-deletions__/";
     this.eventFolderSuffix = ".__secure-webdav-events__/";
+    this.trashFolderSuffix = ".__secure-webdav-trash__/";
     this.missingLazyRemoteConfirmations = 2;
     this.clientId = "";
     this.recentVaultMutations = [];
@@ -887,6 +900,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     this.settings.autoSyncIntervalMinutes = Math.max(0, Math.floor(this.settings.autoSyncIntervalMinutes || 0));
     this.settings.fastSyncRecentChangeLimit = Math.max(10, Math.min(20, Math.floor(this.settings.fastSyncRecentChangeLimit || 20)));
     this.settings.autoUpdateCheckIntervalHours = Math.max(1, Math.min(168, Math.floor(this.settings.autoUpdateCheckIntervalHours || 24)));
+    this.settings.trashRetentionDays = Math.max(1, Math.min(365, Math.floor(this.settings.trashRetentionDays || 30)));
     const rawExcluded = this.settings.excludedSyncFolders;
     const excluded = Array.isArray(rawExcluded) ? rawExcluded : typeof rawExcluded === "string" ? rawExcluded.split(/[,\n]/) : DEFAULT_SETTINGS.excludedSyncFolders;
     this.settings.excludedSyncFolders = [
@@ -1959,12 +1973,14 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       }
       this.lastFastSyncEventAt = Date.now();
       this.lastVaultSyncAt = Date.now();
+      const purgedTrash = await this.purgeExpiredTrashFiles();
       const parts = [];
       if (counts.uploaded > 0) parts.push(this.t(`\u4E0A\u4F20 ${counts.uploaded} \u4E2A\u6587\u4EF6`, `uploaded ${counts.uploaded} file(s)`));
       if (counts.deletedRemoteFiles > 0) parts.push(this.t(`\u5220\u9664\u8FDC\u7AEF ${counts.deletedRemoteFiles} \u4E2A`, `deleted ${counts.deletedRemoteFiles} remote`));
       if (counts.downloadedRemote > 0) parts.push(this.t(`\u62C9\u53D6\u8FDC\u7AEF ${counts.downloadedRemote} \u4E2A`, `pulled ${counts.downloadedRemote} remote`));
       if (counts.conflicts > 0) parts.push(this.t(`${counts.conflicts} \u4E2A\u51B2\u7A81`, `${counts.conflicts} conflict(s)`));
       if (counts.skipped > 0) parts.push(this.t(`\u8DF3\u8FC7 ${counts.skipped} \u4E2A`, `skipped ${counts.skipped}`));
+      if (purgedTrash > 0) parts.push(this.t(`清理回收站 ${purgedTrash} 个`, `purged ${purgedTrash} from trash`));
       const summary = parts.length > 0 ? parts.join("\u3001") : this.t("\u65E0\u65B0\u53D8\u66F4", "No new changes");
       this.lastVaultSyncStatus = this.t(
         `\u5FEB\u901F\u540C\u6B65\u5B8C\u6210\uFF1A${summary}\u3002\u5904\u7406\u4E86 ${remoteEvents.length} \u6761\u8FDC\u7AEF\u4E8B\u4EF6\u3002`,
@@ -2100,7 +2116,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         }
       }
       await this.writeDeletionTombstone(path, entry.remoteSignature);
-      await this.deleteRemoteContentFile(entry.remotePath);
+      await this.moveRemoteFileToTrash(path, entry.remotePath, entry.remoteSignature);
       this.syncIndex.delete(path);
       this.pendingVaultDeletionPaths.delete(path);
       counts.deletedRemoteFiles += 1;
@@ -2654,6 +2670,36 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       throw error;
     }
   }
+  async moveRemoteFileToTrash(vaultPath, remotePath, remoteSignature) {
+    const trashFolder = this.syncSupport.buildTrashFolder();
+    await this.ensureRemoteDirectories(trashFolder);
+    const resp = await this.requestUrl({
+      url: this.buildUploadUrl(trashFolder),
+      method: "MKCOL",
+      headers: { Authorization: this.buildAuthHeader() }
+    });
+    if (![200, 201, 204, 207, 301, 302, 307, 308, 405].includes(resp.status)) {
+      console.warn("MKCOL trash folder returned", resp.status);
+    }
+    const fileResp = await this.requestUrl({
+      url: this.buildUploadUrl(remotePath),
+      method: "GET",
+      headers: { Authorization: this.buildAuthHeader() }
+    });
+    if (fileResp.status === 200) {
+      const trashFilePath = this.syncSupport.buildTrashRemotePath(vaultPath);
+      await this.uploadBinary(trashFilePath, fileResp.arrayBuffer, "application/octet-stream");
+    }
+    const trashMetaPath = this.syncSupport.buildTrashMetaPath(vaultPath);
+    const meta = JSON.stringify({
+      path: vaultPath,
+      remotePath,
+      remoteSignature,
+      deletedAt: Date.now()
+    });
+    await this.uploadBinary(trashMetaPath, this.encodeUtf8(meta), "application/json; charset=utf-8");
+    await this.deleteRemoteContentFile(remotePath);
+  }
   async writeDeletionTombstone(vaultPath, remoteSignature) {
     const payload = {
       path: vaultPath,
@@ -2671,6 +2717,41 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       await this.deleteRemoteContentFile(this.syncSupport.buildDeletionRemotePath(vaultPath));
     } catch {
     }
+  }
+  async purgeExpiredTrashFiles() {
+    const trashFolder = this.syncSupport.buildTrashFolder();
+    let listing;
+    try {
+      listing = await this.listRemoteDirectory(trashFolder);
+    } catch {
+      return 0;
+    }
+    const metaEntries = listing.filter((e) => !e.isCollection && e.remotePath.endsWith(".json"));
+    const retentionMs = this.settings.trashRetentionDays * 864e5;
+    const now = Date.now();
+    let purged = 0;
+    for (const entry of metaEntries) {
+      try {
+        const resp = await this.requestUrl({
+          url: this.buildUploadUrl(entry.remotePath),
+          method: "GET",
+          headers: { Authorization: this.buildAuthHeader() }
+        });
+        if (resp.status !== 200) continue;
+        const meta = JSON.parse(this.decodeUtf8(resp.arrayBuffer));
+        if (!meta || typeof meta.deletedAt !== "number") continue;
+        if (now - meta.deletedAt < retentionMs) continue;
+        if (meta.path) {
+          const trashFilePath = this.syncSupport.buildTrashRemotePath(meta.path);
+          try { await this.deleteRemoteContentFile(trashFilePath); } catch {}
+        }
+        await this.deleteRemoteContentFile(entry.remotePath);
+        purged += 1;
+      } catch {
+        continue;
+      }
+    }
+    return purged;
   }
   async readDeletionTombstone(vaultPath) {
     const response = await this.requestUrl({
@@ -3971,6 +4052,20 @@ var SecureWebdavSettingTab = class extends import_obsidian4.PluginSettingTab {
         const parsed = Number.parseInt(value, 10);
         if (!Number.isNaN(parsed)) {
           this.plugin.settings.fastSyncRecentChangeLimit = Math.max(10, Math.min(20, parsed));
+          await this.plugin.saveSettings();
+        }
+      })
+    );
+    new import_obsidian4.Setting(containerEl).setName(this.plugin.t("回收站保留天数（天）", "Trash retention (days)")).setDesc(
+      this.plugin.t(
+        "删除的文件将移至服务端回收站，超过保留天数后自动彻底删除。范围：1-365。",
+        "Deleted files are moved to the server trash. After the retention period, they are permanently deleted. Range: 1-365."
+      )
+    ).addText(
+      (text) => text.setPlaceholder("30").setValue(String(this.plugin.settings.trashRetentionDays)).onChange(async (value) => {
+        const parsed = Number.parseInt(value, 10);
+        if (!Number.isNaN(parsed)) {
+          this.plugin.settings.trashRetentionDays = Math.max(1, Math.min(365, parsed));
           await this.plugin.saveSettings();
         }
       })
