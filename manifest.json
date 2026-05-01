@@ -1,7 +1,7 @@
 {
   "id": "secure-webdav-images",
   "name": "Secure WebDAV Images",
-  "version": "0.0.28",
+  "version": "0.0.29",
   "minAppVersion": "1.5.0",
   "description": "Separate note images to a dedicated WebDAV folder, sync the rest of the vault to a remote notes folder, and optionally keep Markdown notes in lazy on-demand mode.",
   "author": "Kim-Huang-JunKai"

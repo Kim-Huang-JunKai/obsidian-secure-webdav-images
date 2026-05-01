@@ -2086,6 +2086,23 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         counts.skipped += 1;
         continue;
       }
+      let remote;
+      try { remote = await this.statRemoteFile(entry.remotePath); } catch { remote = null; }
+      if (remote && entry.remoteSignature) {
+        const currentRemoteSig = this.syncSupport.buildRemoteSyncSignature(remote);
+        if (currentRemoteSig !== entry.remoteSignature) {
+          this.pendingVaultDeletionPaths.delete(path);
+          counts.skipped += 1;
+          new import_obsidian4.Notice(
+            this.t(
+              `跳过删除 ${path}：远端已被其他客户端修改。`,
+              `Skipped deleting ${path}: remote was modified by another client.`
+            ),
+            6e3
+          );
+          continue;
+        }
+      }
       await this.writeDeletionTombstone(path, entry.remoteSignature);
       await this.deleteRemoteContentFile(entry.remotePath);
       this.syncIndex.delete(path);
@@ -2126,6 +2143,17 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         continue;
       }
       const remotePath = this.syncSupport.buildVaultSyncRemotePath(file.path);
+      const previous = this.syncIndex.get(path);
+      let remote;
+      try { remote = await this.statRemoteFile(remotePath); } catch { remote = null; }
+      if (remote && previous) {
+        const currentRemoteSig = this.syncSupport.buildRemoteSyncSignature(remote);
+        if (currentRemoteSig !== previous.remoteSignature) {
+          await this.handleUploadConflict(file, remotePath, remote, previous, counts);
+          this.pendingVaultSyncPaths.delete(path);
+          continue;
+        }
+      }
       const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent);
       const localSignature = await this.buildCurrentLocalSignature(file, markdownContent);
       this.syncIndex.set(file.path, {
@@ -2152,6 +2180,33 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         occurredAt: Date.now()
       });
     }
+  }
+  async handleUploadConflict(file, remotePath, remote, previous, counts) {
+    const conflictCopyName = this.buildConflictCopyName(file.path);
+    const conflictRemotePath = this.syncSupport.buildVaultSyncRemotePath(conflictCopyName);
+    await this.downloadRemoteFileToVault(conflictCopyName, { remotePath }, null);
+    const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
+    const localSignature = await this.buildCurrentLocalSignature(file);
+    this.syncIndex.set(file.path, {
+      localSignature,
+      remoteSignature: uploadedRemote.signature,
+      remotePath
+    });
+    counts.conflicts += 1;
+    counts.uploaded += 1;
+    new import_obsidian4.Notice(
+      this.t(
+        `冲突：${file.path} 远端已被其他客户端修改，已将远端版本保存为冲突副本。`,
+        `Conflict: ${file.path} was modified remotely. Remote version saved as conflict copy.`
+      ),
+      8e3
+    );
+  }
+  buildConflictCopyName(vaultPath) {
+    const ext = vaultPath.lastIndexOf(".");
+    const base = ext >= 0 ? vaultPath.substring(0, ext) : vaultPath;
+    const suffix = ext >= 0 ? vaultPath.substring(ext) : "";
+    return `${base}.conflict-${new Date().toISOString().replace(/[:.]/g, "-")}${suffix}`;
   }
   async reconcileOrphanedSyncEntries(remoteFiles, deletionTombstones, counts) {
     const files = this.syncSupport.collectVaultContentFiles();
