@@ -1819,12 +1819,12 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       if (!uploadsReady) {
         return;
       }
-      await this.processPendingVaultRenames(counts);
-      await this.processPendingVaultDeletions(counts);
-      await this.processPendingVaultUploads(counts);
       const limit = this.settings.fastSyncRecentChangeLimit;
       const remoteEvents = await this.listRecentRemoteSyncEvents(limit);
       await this.replayRemoteSyncEvents(remoteEvents, counts);
+      await this.processPendingVaultRenames(counts);
+      await this.processPendingVaultDeletions(counts);
+      await this.processPendingVaultUploads(counts);
       if (this.appliedRemoteEventIds.size > 500) {
         const arr = [...this.appliedRemoteEventIds];
         this.appliedRemoteEventIds = new Set(arr.slice(-500));
@@ -2524,7 +2524,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
   }
   async ensureRemoteEventFolder() {
     const eventFolder = this.syncSupport.buildRemoteEventFolder();
-    await this.ensureRemoteDirectories([eventFolder]);
+    await this.ensureRemoteDirectories(eventFolder);
   }
   async writeRemoteSyncEvent(event) {
     const eventFolder = this.syncSupport.buildRemoteEventFolder();
