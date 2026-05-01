@@ -2080,12 +2080,15 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     }
   }
   async processPendingVaultDeletions(counts) {
+    const deleteGraceMs = 30e3;
     for (const [path, entry] of [...this.pendingVaultDeletionPaths.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
       if (this.syncSupport.shouldSkipContentSyncPath(path)) {
         this.pendingVaultDeletionPaths.delete(path);
         counts.skipped += 1;
         continue;
       }
+      const recordedAt = entry.recordedAt || 0;
+      if (Date.now() - recordedAt < deleteGraceMs) continue;
       let remote;
       try { remote = await this.statRemoteFile(entry.remotePath); } catch { remote = null; }
       if (remote && entry.remoteSignature) {
@@ -2093,13 +2096,6 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         if (currentRemoteSig !== entry.remoteSignature) {
           this.pendingVaultDeletionPaths.delete(path);
           counts.skipped += 1;
-          new import_obsidian4.Notice(
-            this.t(
-              `跳过删除 ${path}：远端已被其他客户端修改。`,
-              `Skipped deleting ${path}: remote was modified by another client.`
-            ),
-            6e3
-          );
           continue;
         }
       }
@@ -2146,12 +2142,10 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       const previous = this.syncIndex.get(path);
       let remote;
       try { remote = await this.statRemoteFile(remotePath); } catch { remote = null; }
-      if (remote && previous) {
-        const currentRemoteSig = this.syncSupport.buildRemoteSyncSignature(remote);
-        if (currentRemoteSig !== previous.remoteSignature) {
-          await this.handleUploadConflict(file, remotePath, remote, previous, counts);
-          this.pendingVaultSyncPaths.delete(path);
-          continue;
+      if (remote && previous && remote.lastModified > (previous.remoteSignature?.split(":")[0] || 0)) {
+        const localMtime = file.stat.mtime;
+        if (remote.lastModified > localMtime) {
+          counts.downloadedRemote += 1;
         }
       }
       const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent);
@@ -2180,33 +2174,6 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         occurredAt: Date.now()
       });
     }
-  }
-  async handleUploadConflict(file, remotePath, remote, previous, counts) {
-    const conflictCopyName = this.buildConflictCopyName(file.path);
-    const conflictRemotePath = this.syncSupport.buildVaultSyncRemotePath(conflictCopyName);
-    await this.downloadRemoteFileToVault(conflictCopyName, { remotePath }, null);
-    const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath);
-    const localSignature = await this.buildCurrentLocalSignature(file);
-    this.syncIndex.set(file.path, {
-      localSignature,
-      remoteSignature: uploadedRemote.signature,
-      remotePath
-    });
-    counts.conflicts += 1;
-    counts.uploaded += 1;
-    new import_obsidian4.Notice(
-      this.t(
-        `冲突：${file.path} 远端已被其他客户端修改，已将远端版本保存为冲突副本。`,
-        `Conflict: ${file.path} was modified remotely. Remote version saved as conflict copy.`
-      ),
-      8e3
-    );
-  }
-  buildConflictCopyName(vaultPath) {
-    const ext = vaultPath.lastIndexOf(".");
-    const base = ext >= 0 ? vaultPath.substring(0, ext) : vaultPath;
-    const suffix = ext >= 0 ? vaultPath.substring(ext) : "";
-    return `${base}.conflict-${new Date().toISOString().replace(/[:.]/g, "-")}${suffix}`;
   }
   async reconcileOrphanedSyncEntries(remoteFiles, deletionTombstones, counts) {
     const files = this.syncSupport.collectVaultContentFiles();
@@ -2335,9 +2302,9 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     if (pathsToCheck.length === 0) return;
     for (const vaultPath of pathsToCheck) {
       if (this.syncSupport.shouldSkipContentSyncPath(vaultPath)) continue;
+      if (this.pendingVaultSyncPaths.has(vaultPath)) continue;
       const entry = this.syncIndex.get(vaultPath);
       if (!entry || !entry.remotePath) continue;
-      let remoteInfo;
       try {
         const resp = await this.requestUrl({
           url: this.buildUploadUrl(entry.remotePath),
@@ -2345,15 +2312,6 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
           headers: { Authorization: this.buildAuthHeader() }
         });
         if (resp.status === 404) {
-          const localFile = this.getVaultFileByPath(vaultPath);
-          if (localFile && !this.pendingVaultSyncPaths.has(vaultPath)) {
-            const localSig = await this.buildCurrentLocalSignature(localFile);
-            if (localSig === entry.localSignature) {
-              await this.removeLocalVaultFile(localFile);
-              this.syncIndex.delete(vaultPath);
-              counts.deletedRemoteFiles += 1;
-            }
-          }
           continue;
         }
         if (resp.status !== 200) continue;
@@ -2362,17 +2320,17 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         const remoteSig = `${new Date(lastModified).getTime() || 0}:${contentLength}`;
         if (remoteSig === entry.remoteSignature) continue;
         const localFile = this.getVaultFileByPath(vaultPath);
-        if (localFile) {
-          const localSig = await this.buildCurrentLocalSignature(localFile);
-          if (localSig !== entry.localSignature) continue;
+        const remoteTime = new Date(lastModified).getTime() || 0;
+        const localTime = localFile ? localFile.stat.mtime : 0;
+        if (remoteTime > localTime) {
+          await this.downloadRemoteFileToVault(vaultPath, { remotePath: entry.remotePath }, localFile);
+          const updatedFile = this.getVaultFileByPath(vaultPath);
+          if (updatedFile) {
+            const newLocalSig = await this.buildCurrentLocalSignature(updatedFile);
+            this.syncIndex.set(vaultPath, { remotePath: entry.remotePath, localSignature: newLocalSig, remoteSignature: remoteSig });
+          }
+          counts.downloadedRemote += 1;
         }
-        await this.downloadRemoteFileToVault(vaultPath, { remotePath: entry.remotePath }, localFile);
-        const updatedFile = this.getVaultFileByPath(vaultPath);
-        if (updatedFile) {
-          const newLocalSig = await this.buildCurrentLocalSignature(updatedFile);
-          this.syncIndex.set(vaultPath, { remotePath: entry.remotePath, localSignature: newLocalSig, remoteSignature: remoteSig });
-        }
-        counts.downloadedRemote += 1;
       } catch {
         continue;
       }
