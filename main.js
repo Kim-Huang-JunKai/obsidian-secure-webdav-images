@@ -559,7 +559,8 @@ var DEFAULT_SETTINGS = {
   compressThresholdKb: 300,
   maxImageDimension: 2200,
   jpegQuality: 82,
-  fastSyncRecentChangeLimit: 20
+  fastSyncRecentChangeLimit: 20,
+  autoUpdateCheckIntervalHours: 24
 };
 var MIME_MAP = {
   jpg: "image/jpeg",
@@ -610,6 +611,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     this.appliedRemoteEventIds = /* @__PURE__ */ new Set();
     this.lastFastSyncEventAt = 0;
     this.pendingRemoteEventWrites = [];
+    this.lastAutoUpdateCheckAt = 0;
   }
   initializeSupportModules() {
     this.imageSupport = new SecureWebdavImageSupport({
@@ -735,6 +737,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       this.app.vault.on("rename", (file, oldPath) => this.trackVaultMutation(() => this.handleVaultRename(file, oldPath)))
     );
     this.setupAutoSync();
+    this.setupAutoUpdateCheck();
     void this.uploadQueue.processPendingTasks();
     this.register(() => {
       for (const blobUrl of this.blobUrls) {
@@ -784,6 +787,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       this.appliedRemoteEventIds = /* @__PURE__ */ new Set();
       this.lastFastSyncEventAt = 0;
       this.pendingRemoteEventWrites = [];
+      this.lastAutoUpdateCheckAt = 0;
       return;
     }
     const candidate = loaded;
@@ -855,6 +859,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       );
       this.lastFastSyncEventAt = typeof candidate.lastFastSyncEventAt === "number" ? candidate.lastFastSyncEventAt : 0;
       this.pendingRemoteEventWrites = Array.isArray(candidate.pendingRemoteEventWrites) ? candidate.pendingRemoteEventWrites : [];
+      this.lastAutoUpdateCheckAt = typeof candidate.lastAutoUpdateCheckAt === "number" ? candidate.lastAutoUpdateCheckAt : 0;
       this.normalizeEffectiveSettings();
       return;
     }
@@ -874,12 +879,14 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     this.appliedRemoteEventIds = /* @__PURE__ */ new Set();
     this.lastFastSyncEventAt = 0;
     this.pendingRemoteEventWrites = [];
+    this.lastAutoUpdateCheckAt = 0;
     this.normalizeEffectiveSettings();
   }
   normalizeEffectiveSettings() {
     this.settings.deleteLocalAfterUpload = true;
     this.settings.autoSyncIntervalMinutes = Math.max(0, Math.floor(this.settings.autoSyncIntervalMinutes || 0));
     this.settings.fastSyncRecentChangeLimit = Math.max(10, Math.min(20, Math.floor(this.settings.fastSyncRecentChangeLimit || 20)));
+    this.settings.autoUpdateCheckIntervalHours = Math.max(1, Math.min(168, Math.floor(this.settings.autoUpdateCheckIntervalHours || 24)));
     const rawExcluded = this.settings.excludedSyncFolders;
     const excluded = Array.isArray(rawExcluded) ? rawExcluded : typeof rawExcluded === "string" ? rawExcluded.split(/[,\n]/) : DEFAULT_SETTINGS.excludedSyncFolders;
     this.settings.excludedSyncFolders = [
@@ -911,6 +918,123 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       }, intervalMs)
     );
   }
+  compareSemver(a, b) {
+    const pa = a.replace(/^v/, "").split(".").map(Number);
+    const pb = b.replace(/^v/, "").split(".").map(Number);
+    for (let i = 0; i < 3; i++) {
+      const na = pa[i] || 0;
+      const nb = pb[i] || 0;
+      if (na !== nb) return na > nb ? 1 : -1;
+    }
+    return 0;
+  }
+  setupAutoUpdateCheck() {
+    const hours = this.settings.autoUpdateCheckIntervalHours;
+    if (hours <= 0) return;
+    const intervalMs = hours * 3600 * 1e3;
+    this.registerInterval(
+      window.setInterval(() => {
+        void this.checkForPluginUpdate(false);
+      }, intervalMs)
+    );
+  }
+  async fetchLatestRelease() {
+    const url = "https://api.github.com/repos/Kim-Huang-JunKai/obsidian-secure-webdav-images/releases/latest";
+    try {
+      const resp = await this.requestUrl({ url, method: "GET" });
+      if (resp.status !== 200) return null;
+      const text = this.decodeUtf8(resp.arrayBuffer);
+      const data = JSON.parse(text);
+      if (!data || !data.tag_name || !Array.isArray(data.assets)) return null;
+      return {
+        tagName: data.tag_name,
+        assets: data.assets.map((a) => ({ name: a.name, downloadUrl: a.browser_download_url, size: a.size }))
+      };
+    } catch (e) {
+      console.warn("[secure-webdav-images] fetch latest release failed:", e);
+      return null;
+    }
+  }
+  async checkForPluginUpdate(showNotice) {
+    const release = await this.fetchLatestRelease();
+    this.lastAutoUpdateCheckAt = Date.now();
+    await this.savePluginState();
+    if (!release) {
+      if (showNotice) {
+        new import_obsidian4.Notice(this.t("检查更新失败，无法连接 GitHub。", "Update check failed: cannot reach GitHub."));
+      }
+      return;
+    }
+    const remoteVersion = release.tagName.replace(/^v/, "");
+    const localVersion = this.manifest.version;
+    const cmp = this.compareSemver(remoteVersion, localVersion);
+    if (cmp <= 0) {
+      if (showNotice) {
+        new import_obsidian4.Notice(this.t(`当前已是最新版本 v${localVersion}。`, `Already up to date: v${localVersion}.`));
+      }
+      return;
+    }
+    if (showNotice) {
+      new import_obsidian4.Notice(this.t(`发现新版本 v${remoteVersion}，正在下载更新...`, `New version v${remoteVersion} found, downloading update...`));
+    }
+    await this.performUpdate(release);
+  }
+  async performUpdate(release) {
+    const requiredFiles = ["main.js", "manifest.json", "styles.css"];
+    const assetMap = /* @__PURE__ */ new Map();
+    for (const asset of release.assets) {
+      if (requiredFiles.includes(asset.name)) {
+        assetMap.set(asset.name, asset);
+      }
+    }
+    if (assetMap.size < requiredFiles.length) {
+      new import_obsidian4.Notice(this.t("更新失败：Release 缺少必要文件。", "Update failed: Release is missing required files."));
+      return;
+    }
+    let basePath;
+    try {
+      basePath = this.app.vault.adapter.basePath;
+    } catch {
+      basePath = this.app.vault.getRoot().vault.adapter.basePath;
+    }
+    const pluginDir = basePath + "/.obsidian/plugins/secure-webdav-images/";
+    const fs = require("fs");
+    const path = require("path");
+    const downloaded = [];
+    try {
+      for (const fileName of requiredFiles) {
+        const asset = assetMap.get(fileName);
+        if (!asset) continue;
+        const resp = await this.requestUrl({ url: asset.downloadUrl, method: "GET" });
+        if (resp.status !== 200) {
+          throw new Error(`Download ${fileName} returned status ${resp.status}`);
+        }
+        const tmpPath = path.join(pluginDir, fileName + ".tmp");
+        fs.writeFileSync(tmpPath, Buffer.from(resp.arrayBuffer));
+        downloaded.push({ tmpPath, fileName });
+      }
+      for (const { tmpPath, fileName } of downloaded) {
+        const finalPath = path.join(pluginDir, fileName);
+        fs.renameSync(tmpPath, finalPath);
+      }
+      const remoteVersion = release.tagName.replace(/^v/, "");
+      new import_obsidian4.Notice(
+        this.t(
+          `插件已更新到 v${remoteVersion}，请重新加载插件或重启 Obsidian。`,
+          `Plugin updated to v${remoteVersion}. Please reload the plugin or restart Obsidian.`
+        ),
+        1e4
+      );
+    } catch (e) {
+      for (const { tmpPath } of downloaded) {
+        try { fs.unlinkSync(tmpPath); } catch {}
+      }
+      new import_obsidian4.Notice(
+        this.t(`更新失败：${e.message}`, `Update failed: ${e.message}`),
+        1e4
+      );
+    }
+  }
   async runAutoSyncTick() {
     if (this.autoSyncTickInProgress) {
       return;
@@ -939,7 +1063,8 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       recentVaultMutations: this.recentVaultMutations,
       appliedRemoteEventIds: [...this.appliedRemoteEventIds],
       lastFastSyncEventAt: this.lastFastSyncEventAt,
-      pendingRemoteEventWrites: this.pendingRemoteEventWrites
+      pendingRemoteEventWrites: this.pendingRemoteEventWrites,
+      lastAutoUpdateCheckAt: this.lastAutoUpdateCheckAt
     });
   }
   async saveSettings() {
@@ -3632,6 +3757,36 @@ var SecureWebdavSettingTab = class extends import_obsidian4.PluginSettingTab {
     ).addText((text) => {
       text.setValue(this.plugin.manifest.version);
       text.setDisabled(true);
+    });
+    new import_obsidian4.Setting(containerEl).setName(this.plugin.t("检查更新", "Check for updates")).setDesc(
+      this.plugin.lastAutoUpdateCheckAt
+        ? this.plugin.t(
+            `上次检查：${new Date(this.plugin.lastAutoUpdateCheckAt).toLocaleString()}`,
+            `Last checked: ${new Date(this.plugin.lastAutoUpdateCheckAt).toLocaleString()}`
+          )
+        : this.plugin.t("尚未检查过更新", "No update check yet")
+    ).addButton((btn) => {
+      btn.setButtonText(this.plugin.t("立即检查", "Check now"));
+      btn.onClick(() => {
+        btn.setButtonText(this.plugin.t("检查中...", "Checking..."));
+        btn.setDisabled(true);
+        void this.plugin.checkForPluginUpdate(true).finally(() => {
+          btn.setButtonText(this.plugin.t("立即检查", "Check now"));
+          btn.setDisabled(false);
+        });
+      });
+    });
+    new import_obsidian4.Setting(containerEl).setName(this.plugin.t("自动检查更新间隔（小时）", "Auto update check interval (hours)")).setDesc(
+      this.plugin.t("每隔指定小时数自动检查 GitHub 是否有新版本。设为 0 可关闭自动检查。", "Automatically check GitHub for new versions every N hours. Set to 0 to disable.")
+    ).addText((text) => {
+      text.setValue(String(this.plugin.settings.autoUpdateCheckIntervalHours));
+      text.onChange(async (value) => {
+        const num = parseInt(value, 10);
+        if (!isNaN(num) && num >= 0) {
+          this.plugin.settings.autoUpdateCheckIntervalHours = num;
+          await this.plugin.saveSettings();
+        }
+      });
     });
     containerEl.createEl("h3", { text: this.plugin.t("\u754C\u9762\u8BED\u8A00", "Interface language") });
     new import_obsidian4.Setting(containerEl).setName(this.plugin.t("\u8BED\u8A00", "Language")).setDesc(this.plugin.t("\u8BBE\u7F6E\u9875\u652F\u6301\u81EA\u52A8\u3001\u4E2D\u6587\u3001\u82F1\u6587\u5207\u6362\u3002", "Switch the settings UI between auto, Chinese, and English.")).addDropdown(
