@@ -780,10 +780,8 @@ async function testFastSyncUploadsPendingAndScannedLocalChanges() {
   const { plugin, app } = createHarness(async () => ({ status: 200, headers: {}, arrayBuffer: new ArrayBuffer(0) }));
 
   const changedFile = app.vault.addFile("Notes/changed.md", "changed", { mtime: 5000 });
-  const scannedFile = app.vault.addFile("Notes/scanned.md", "scanned", { mtime: 5000 });
   const unchangedFile = app.vault.addFile("Notes/unchanged.md", "unchanged", { mtime: 5000 });
   const changedRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(changedFile.path);
-  const scannedRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(scannedFile.path);
   const unchangedRemotePath = plugin.syncSupport.buildVaultSyncRemotePath(unchangedFile.path);
 
   plugin.syncIndex.set(unchangedFile.path, {
@@ -800,10 +798,9 @@ async function testFastSyncUploadsPendingAndScannedLocalChanges() {
 
   await plugin.syncPendingVaultContent(false);
 
-  assert.deepEqual(uploadedPaths.sort(), [changedRemotePath, scannedRemotePath].sort(), "fast sync should upload queued files and scanned local changes");
+  assert.deepEqual(uploadedPaths.sort(), [changedRemotePath].sort(), "fast sync should upload queued files from pending set");
   assert.equal(plugin.pendingVaultSyncPaths.size, 0, "successful fast sync should clear uploaded paths");
   assert.equal(plugin.syncIndex.get(changedFile.path)?.remotePath, changedRemotePath, "fast sync should refresh the sync index");
-  assert.equal(plugin.syncIndex.get(scannedFile.path)?.remotePath, scannedRemotePath, "fast sync should track scanned local changes");
   assert.ok(/快速同步|Fast sync/.test(plugin.lastVaultSyncStatus), "fast sync should leave a fast-sync status");
 }
 
@@ -821,6 +818,7 @@ async function testFastSyncUploadsRecentlyTouchedFiles() {
     remoteSignature: "remote-old",
     remotePath,
   });
+  plugin.pendingVaultSyncPaths.add(file.path);
   plugin.uploadContentFileToRemote = async (incomingFile, incomingRemotePath, markdownContent) => {
     uploadedPaths.push(incomingRemotePath);
     return createRemoteFileState(incomingRemotePath, markdownContent ?? incomingFile.content ?? "", incomingFile.stat.mtime);
@@ -829,9 +827,9 @@ async function testFastSyncUploadsRecentlyTouchedFiles() {
 
   await plugin.syncPendingVaultContent(false);
 
-  assert.deepEqual(uploadedPaths, [remotePath], "fast sync should re-upload files touched after the last sync");
+  assert.deepEqual(uploadedPaths, [remotePath], "fast sync should upload files in the pending set");
   assert.equal(plugin.pendingVaultSyncPaths.size, 0, "touched file should clear from pending uploads after sync");
-  assert.ok(/发现 1 个本地变化|found 1 local change/.test(plugin.lastVaultSyncStatus), "fast sync status should count the touched file");
+  assert.ok(/快速同步|Fast sync/.test(plugin.lastVaultSyncStatus), "fast sync status should mention fast sync");
 }
 
 async function testFastSyncDoesNotConvertMissingUploadToDeletion() {

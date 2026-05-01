@@ -470,6 +470,9 @@ var SecureWebdavSyncSupport = class {
   buildDeletionFolder() {
     return `${this.normalizeFolder(this.deps.getVaultSyncRemoteFolder()).replace(/\/$/, "")}${this.deps.deletionFolderSuffix}`;
   }
+  buildRemoteEventFolder() {
+    return `${this.normalizeFolder(this.deps.getVaultSyncRemoteFolder()).replace(/\/$/, "")}${this.deps.eventFolderSuffix}`;
+  }
   buildDeletionRemotePath(vaultPath) {
     return `${this.buildDeletionFolder()}${this.deps.encodeBase64Url(vaultPath)}.json`;
   }
@@ -555,7 +558,8 @@ var DEFAULT_SETTINGS = {
   compressImages: true,
   compressThresholdKb: 300,
   maxImageDimension: 2200,
-  jpegQuality: 82
+  jpegQuality: 82,
+  fastSyncRecentChangeLimit: 20
 };
 var MIME_MAP = {
   jpg: "image/jpeg",
@@ -599,7 +603,13 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     this.syncInProgress = false;
     this.autoSyncTickInProgress = false;
     this.deletionFolderSuffix = ".__secure-webdav-deletions__/";
+    this.eventFolderSuffix = ".__secure-webdav-events__/";
     this.missingLazyRemoteConfirmations = 2;
+    this.clientId = "";
+    this.recentVaultMutations = [];
+    this.appliedRemoteEventIds = /* @__PURE__ */ new Set();
+    this.lastFastSyncEventAt = 0;
+    this.pendingRemoteEventWrites = [];
   }
   initializeSupportModules() {
     this.imageSupport = new SecureWebdavImageSupport({
@@ -635,6 +645,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       getVaultSyncRemoteFolder: () => this.settings.vaultSyncRemoteFolder,
       getExcludedSyncFolders: () => this.settings.excludedSyncFolders ?? [],
       deletionFolderSuffix: this.deletionFolderSuffix,
+      eventFolderSuffix: this.eventFolderSuffix,
       encodeBase64Url: (value) => this.arrayBufferToBase64(this.encodeUtf8(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""),
       decodeBase64Url: (value) => {
         const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
@@ -768,6 +779,11 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       this.pendingVaultSyncPaths = /* @__PURE__ */ new Set();
       this.pendingVaultDeletionPaths = /* @__PURE__ */ new Map();
       this.pendingVaultRenamePaths = /* @__PURE__ */ new Map();
+      this.clientId = this.generateClientId();
+      this.recentVaultMutations = [];
+      this.appliedRemoteEventIds = /* @__PURE__ */ new Set();
+      this.lastFastSyncEventAt = 0;
+      this.pendingRemoteEventWrites = [];
       return;
     }
     const candidate = loaded;
@@ -832,6 +848,13 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       this.syncedDirectories = new Set(
         Array.isArray(candidate.syncedDirectories) ? candidate.syncedDirectories : []
       );
+      this.clientId = typeof candidate.clientId === "string" && candidate.clientId.length > 0 ? candidate.clientId : this.generateClientId();
+      this.recentVaultMutations = Array.isArray(candidate.recentVaultMutations) ? candidate.recentVaultMutations : [];
+      this.appliedRemoteEventIds = new Set(
+        Array.isArray(candidate.appliedRemoteEventIds) ? candidate.appliedRemoteEventIds : []
+      );
+      this.lastFastSyncEventAt = typeof candidate.lastFastSyncEventAt === "number" ? candidate.lastFastSyncEventAt : 0;
+      this.pendingRemoteEventWrites = Array.isArray(candidate.pendingRemoteEventWrites) ? candidate.pendingRemoteEventWrites : [];
       this.normalizeEffectiveSettings();
       return;
     }
@@ -846,11 +869,17 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     this.pendingVaultRenamePaths = /* @__PURE__ */ new Map();
     this.lastVaultSyncAt = 0;
     this.lastVaultSyncStatus = "";
+    this.clientId = this.generateClientId();
+    this.recentVaultMutations = [];
+    this.appliedRemoteEventIds = /* @__PURE__ */ new Set();
+    this.lastFastSyncEventAt = 0;
+    this.pendingRemoteEventWrites = [];
     this.normalizeEffectiveSettings();
   }
   normalizeEffectiveSettings() {
     this.settings.deleteLocalAfterUpload = true;
     this.settings.autoSyncIntervalMinutes = Math.max(0, Math.floor(this.settings.autoSyncIntervalMinutes || 0));
+    this.settings.fastSyncRecentChangeLimit = Math.max(10, Math.min(20, Math.floor(this.settings.fastSyncRecentChangeLimit || 20)));
     const rawExcluded = this.settings.excludedSyncFolders;
     const excluded = Array.isArray(rawExcluded) ? rawExcluded : typeof rawExcluded === "string" ? rawExcluded.split(/[,\n]/) : DEFAULT_SETTINGS.excludedSyncFolders;
     this.settings.excludedSyncFolders = [
@@ -861,6 +890,14 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
   }
   normalizeFolder(input) {
     return normalizeFolder(input);
+  }
+  generateClientId() {
+    let hostname = "unknown";
+    try {
+      const os = require("os");
+      hostname = os.hostname().toLowerCase().replace(/[^a-z0-9-]/g, "-");
+    } catch (_) {}
+    return `${hostname}-kim`;
   }
   setupAutoSync() {
     const minutes = this.settings.autoSyncIntervalMinutes;
@@ -897,7 +934,12 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       syncIndex: Object.fromEntries(this.syncIndex.entries()),
       syncedDirectories: [...this.syncedDirectories],
       lastVaultSyncAt: this.lastVaultSyncAt,
-      lastVaultSyncStatus: this.lastVaultSyncStatus
+      lastVaultSyncStatus: this.lastVaultSyncStatus,
+      clientId: this.clientId,
+      recentVaultMutations: this.recentVaultMutations,
+      appliedRemoteEventIds: [...this.appliedRemoteEventIds],
+      lastFastSyncEventAt: this.lastFastSyncEventAt,
+      pendingRemoteEventWrites: this.pendingRemoteEventWrites
     });
   }
   async saveSettings() {
@@ -958,6 +1000,15 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       return;
     }
     this.markPendingVaultSync(file.path);
+    const isCreate = !this.syncIndex.has(file.path);
+    const indexed = this.syncIndex.get(file.path);
+    this.appendRecentMutation({
+      kind: isCreate ? "create" : "modify",
+      path: file.path,
+      localSignature: indexed?.localSignature,
+      remotePath: indexed?.remotePath,
+      remoteSignature: indexed?.remoteSignature
+    });
     if (file.extension === "md") {
       const content = await this.app.vault.read(file);
       const nextRefs = this.extractRemotePathsFromText(content);
@@ -979,6 +1030,13 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       return;
     }
     if (!this.syncSupport.shouldSkipContentSyncPath(file.path)) {
+      const indexed = this.syncIndex.get(file.path);
+      this.appendRecentMutation({
+        kind: "delete",
+        path: file.path,
+        remotePath: indexed?.remotePath,
+        remoteSignature: indexed?.remoteSignature
+      });
       this.markPendingVaultDeletion(file.path);
       this.syncIndex.delete(file.path);
       await this.savePluginState();
@@ -992,9 +1050,18 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       return;
     }
     if (!this.syncSupport.shouldSkipContentSyncPath(oldPath)) {
+      const indexed = this.syncIndex.get(oldPath);
       const trackedOldPath = this.recordPendingVaultRename(oldPath, file.path);
       this.markPendingVaultDeletion(oldPath);
       this.syncIndex.delete(oldPath);
+      this.appendRecentMutation({
+        kind: "rename",
+        path: oldPath,
+        oldPath,
+        newPath: file.path,
+        remotePath: indexed?.remotePath,
+        remoteSignature: indexed?.remoteSignature
+      });
       await this.savePluginState();
       this.schedulePriorityRenameSync(trackedOldPath);
     }
@@ -1059,6 +1126,97 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     });
     return trackedOldPath;
   }
+  appendRecentMutation(entry) {
+    const now = Date.now();
+    const randomSuffix = Math.random().toString(36).slice(2, 8);
+    const id = `${now}-${this.clientId}-${entry.kind}-${randomSuffix}`;
+    const mutation = {
+      id,
+      kind: entry.kind,
+      path: entry.path,
+      oldPath: entry.oldPath,
+      newPath: entry.newPath,
+      localSignature: entry.localSignature,
+      remotePath: entry.remotePath,
+      remoteSignature: entry.remoteSignature,
+      recordedAt: now,
+      source: "local-event",
+      status: "pending"
+    };
+    this.recentVaultMutations.push(mutation);
+    this.coalesceRecentMutations();
+    if (this.recentVaultMutations.length > 200) {
+      this.recentVaultMutations = this.recentVaultMutations.slice(-200);
+    }
+  }
+  coalesceRecentMutations() {
+    const mutations = this.recentVaultMutations;
+    if (mutations.length <= 1) return;
+    const survivors = [];
+    const pathLastIndex = /* @__PURE__ */ new Map();
+    const renameChainNewToOld = /* @__PURE__ */ new Map();
+    for (let i = 0; i < mutations.length; i++) {
+      const m = mutations[i];
+      const key = m.kind === "rename" ? m.oldPath : m.path;
+      pathLastIndex.set(key, i);
+      if (m.kind === "rename" && m.newPath) {
+        renameChainNewToOld.set(m.newPath, m.oldPath);
+      }
+    }
+    const cancelled = /* @__PURE__ */ new Set();
+    const seenPath = /* @__PURE__ */ new Map();
+    for (let i = 0; i < mutations.length; i++) {
+      const m = mutations[i];
+      const key = m.kind === "rename" ? m.oldPath : m.path;
+      if (cancelled.has(i)) continue;
+      const prevIdx = seenPath.get(key);
+      if (prevIdx !== void 0) {
+        const prev = mutations[prevIdx];
+        if (prev.kind === "create" && m.kind === "create") {
+          cancelled.add(prevIdx);
+        } else if (prev.kind === "create" && m.kind === "modify") {
+          m.kind = "create";
+          cancelled.add(prevIdx);
+        } else if (prev.kind === "modify" && m.kind === "create") {
+          cancelled.add(prevIdx);
+        } else if (prev.kind === "create" && m.kind === "delete") {
+          cancelled.add(prevIdx);
+          cancelled.add(i);
+          continue;
+        } else if (prev.kind === "modify" && m.kind === "modify") {
+          cancelled.add(prevIdx);
+        } else if (prev.kind === "rename" && m.kind === "modify") {
+          m.kind = "rename";
+          m.localSignature = m.localSignature;
+          cancelled.add(prevIdx);
+        }
+      }
+      if (m.kind === "rename" && m.newPath) {
+        let chainOrigin = m.oldPath;
+        let depth = 0;
+        while (renameChainNewToOld.has(chainOrigin) && depth < 10) {
+          const older = renameChainNewToOld.get(chainOrigin);
+          chainOrigin = older;
+          depth++;
+          for (let j = 0; j < i; j++) {
+            const old = mutations[j];
+            if (old.kind === "rename" && old.newPath === chainOrigin) {
+              m.oldPath = old.oldPath;
+              cancelled.add(j);
+              break;
+            }
+          }
+        }
+      }
+      seenPath.set(key, i);
+    }
+    for (let i = 0; i < mutations.length; i++) {
+      if (!cancelled.has(i)) {
+        survivors.push(mutations[i]);
+      }
+    }
+    this.recentVaultMutations = survivors;
+  }
   extractRemotePathsFromText(content) {
     const refs = /* @__PURE__ */ new Set();
     const spanRegex = /data-secure-webdav="([^"]+)"/g;
@@ -1119,6 +1277,16 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       });
       this.pendingVaultSyncPaths.delete(file.path);
       await this.deleteDeletionTombstone(file.path);
+      const localSig = await this.buildCurrentLocalSignature(file, content);
+      await this.writeRemoteSyncEvent({
+        id: `${Date.now()}-${this.clientId}-modify-${Math.random().toString(36).slice(2, 8)}`,
+        kind: "modify",
+        path: file.path,
+        remotePath,
+        remoteSignature: uploadedRemote.signature,
+        localSignature: localSig,
+        occurredAt: Date.now()
+      });
       this.lastVaultSyncAt = Date.now();
       this.lastVaultSyncStatus = this.t(
         reason === "image-add" ? `\u5DF2\u4F18\u5148\u540C\u6B65\u56FE\u7247\u65B0\u589E\u540E\u7684\u7B14\u8BB0\uFF1A${file.basename}` : `\u5DF2\u4F18\u5148\u540C\u6B65\u56FE\u7247\u5220\u9664\u540E\u7684\u7B14\u8BB0\uFF1A${file.basename}`,
@@ -1643,7 +1811,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       return;
     }
     this.syncInProgress = true;
-    const counts = { uploaded: 0, deletedRemoteFiles: 0, skipped: 0, detectedLocalChanges: 0 };
+    const counts = { uploaded: 0, deletedRemoteFiles: 0, skipped: 0, detectedLocalChanges: 0, downloadedRemote: 0, conflicts: 0 };
     try {
       this.ensureConfigured();
       await this.waitForPendingVaultMutations();
@@ -1652,13 +1820,27 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         return;
       }
       await this.processPendingVaultRenames(counts);
-      await this.queueChangedLocalFilesForFastSync(counts);
       await this.processPendingVaultDeletions(counts);
       await this.processPendingVaultUploads(counts);
+      const limit = this.settings.fastSyncRecentChangeLimit;
+      const remoteEvents = await this.listRecentRemoteSyncEvents(limit);
+      await this.replayRemoteSyncEvents(remoteEvents, counts);
+      if (this.appliedRemoteEventIds.size > 500) {
+        const arr = [...this.appliedRemoteEventIds];
+        this.appliedRemoteEventIds = new Set(arr.slice(-500));
+      }
+      this.lastFastSyncEventAt = Date.now();
       this.lastVaultSyncAt = Date.now();
+      const parts = [];
+      if (counts.uploaded > 0) parts.push(this.t(`\u4E0A\u4F20 ${counts.uploaded} \u4E2A\u6587\u4EF6`, `uploaded ${counts.uploaded} file(s)`));
+      if (counts.deletedRemoteFiles > 0) parts.push(this.t(`\u5220\u9664\u8FDC\u7AEF ${counts.deletedRemoteFiles} \u4E2A`, `deleted ${counts.deletedRemoteFiles} remote`));
+      if (counts.downloadedRemote > 0) parts.push(this.t(`\u62C9\u53D6\u8FDC\u7AEF ${counts.downloadedRemote} \u4E2A`, `pulled ${counts.downloadedRemote} remote`));
+      if (counts.conflicts > 0) parts.push(this.t(`${counts.conflicts} \u4E2A\u51B2\u7A81`, `${counts.conflicts} conflict(s)`));
+      if (counts.skipped > 0) parts.push(this.t(`\u8DF3\u8FC7 ${counts.skipped} \u4E2A`, `skipped ${counts.skipped}`));
+      const summary = parts.length > 0 ? parts.join("\u3001") : this.t("\u65E0\u65B0\u53D8\u66F4", "No new changes");
       this.lastVaultSyncStatus = this.t(
-        `\u5DF2\u5FEB\u901F\u540C\u6B65\uFF1A\u53D1\u73B0 ${counts.detectedLocalChanges} \u4E2A\u672C\u5730\u53D8\u5316\uFF0C\u4E0A\u4F20 ${counts.uploaded} \u4E2A\u6587\u4EF6\uFF0C\u5220\u9664\u8FDC\u7AEF\u5185\u5BB9 ${counts.deletedRemoteFiles} \u4E2A\uFF0C\u8DF3\u8FC7 ${counts.skipped} \u4E2A\u6587\u4EF6\u3002`,
-        `Fast sync found ${counts.detectedLocalChanges} local change(s), uploaded ${counts.uploaded} file(s), deleted ${counts.deletedRemoteFiles} remote content file(s), and skipped ${counts.skipped} file(s).`
+        `\u5FEB\u901F\u540C\u6B65\u5B8C\u6210\uFF1A${summary}\u3002\u5904\u7406\u4E86 ${remoteEvents.length} \u6761\u8FDC\u7AEF\u4E8B\u4EF6\u3002`,
+        `Fast sync done: ${summary}. Processed ${remoteEvents.length} remote event(s).`
       );
       await this.savePluginState();
       if (showNotice) {
@@ -1748,6 +1930,25 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       this.pendingVaultRenamePaths.delete(oldPath);
       await this.deleteDeletionTombstone(file.path);
       counts.uploaded += 1;
+      const recentMutation = this.recentVaultMutations.find((m) => m.kind === "rename" && m.oldPath === oldPath && m.status === "pending");
+      if (recentMutation) {
+        recentMutation.status = "applied";
+        recentMutation.newPath = entry.newPath;
+        recentMutation.remotePath = remotePath;
+        recentMutation.remoteSignature = uploadedRemote.signature;
+      }
+      await this.writeRemoteSyncEvent({
+        id: `${Date.now()}-${this.clientId}-rename-${Math.random().toString(36).slice(2, 8)}`,
+        kind: "rename",
+        path: oldPath,
+        oldPath,
+        newPath: entry.newPath,
+        remotePath,
+        remoteSignature: uploadedRemote.signature,
+        localSignature,
+        tombstonePath: this.syncSupport.buildDeletionRemotePath(oldPath),
+        occurredAt: Date.now()
+      });
     }
   }
   async processPendingVaultDeletions(counts) {
@@ -1762,6 +1963,19 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       this.syncIndex.delete(path);
       this.pendingVaultDeletionPaths.delete(path);
       counts.deletedRemoteFiles += 1;
+      const recentMutation = this.recentVaultMutations.find((m) => m.path === path && m.kind === "delete" && m.status === "pending");
+      if (recentMutation) {
+        recentMutation.status = "applied";
+      }
+      await this.writeRemoteSyncEvent({
+        id: `${Date.now()}-${this.clientId}-delete-${Math.random().toString(36).slice(2, 8)}`,
+        kind: "delete",
+        path,
+        remotePath: entry.remotePath,
+        remoteSignature: entry.remoteSignature,
+        tombstonePath: this.syncSupport.buildDeletionRemotePath(path),
+        occurredAt: Date.now()
+      });
     }
   }
   async processPendingVaultUploads(counts) {
@@ -1794,6 +2008,21 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       await this.deleteDeletionTombstone(file.path);
       this.pendingVaultSyncPaths.delete(path);
       counts.uploaded += 1;
+      const recentMutation = this.recentVaultMutations.find((m) => m.path === path && (m.kind === "create" || m.kind === "modify") && m.status === "pending");
+      if (recentMutation) {
+        recentMutation.status = "applied";
+        recentMutation.remotePath = remotePath;
+        recentMutation.remoteSignature = uploadedRemote.signature;
+      }
+      await this.writeRemoteSyncEvent({
+        id: `${Date.now()}-${this.clientId}-${recentMutation?.kind || "modify"}-${Math.random().toString(36).slice(2, 8)}`,
+        kind: recentMutation?.kind || "modify",
+        path: file.path,
+        remotePath,
+        remoteSignature: uploadedRemote.signature,
+        localSignature,
+        occurredAt: Date.now()
+      });
     }
   }
   async reconcileOrphanedSyncEntries(remoteFiles, deletionTombstones, counts) {
@@ -1906,6 +2135,158 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     const ext = dotIndex > 0 ? name.slice(dotIndex) : "";
     const prefix = `${dir}${stem}.sync-conflict-`;
     return this.app.vault.getFiles().map((file) => file.path).find((path) => path.startsWith(prefix) && (!ext || path.endsWith(ext))) ?? null;
+  }
+  async replayRemoteSyncEvents(events, counts) {
+    for (const event of events) {
+      try {
+        await this.replaySingleRemoteEvent(event, counts);
+        this.appliedRemoteEventIds.add(event.id);
+      } catch (err) {
+        console.warn("Failed to replay remote event:", event.id, err);
+        counts.skipped += 1;
+      }
+    }
+  }
+  async replaySingleRemoteEvent(event, counts) {
+    if (event.kind === "create" || event.kind === "modify") {
+      await this.replayRemoteCreateOrModify(event, counts);
+    } else if (event.kind === "delete") {
+      await this.replayRemoteDelete(event, counts);
+    } else if (event.kind === "rename") {
+      await this.replayRemoteRename(event, counts);
+    }
+  }
+  async replayRemoteCreateOrModify(event, counts) {
+    const vaultPath = this.syncSupport.remotePathToVaultPath(event.remotePath);
+    if (!vaultPath || this.syncSupport.shouldSkipContentSyncPath(vaultPath)) {
+      counts.skipped += 1;
+      return;
+    }
+    const existingFile = this.getVaultFileByPath(vaultPath);
+    const remotePath = event.remotePath;
+    let remote;
+    try {
+      remote = await this.statRemoteFile(remotePath);
+    } catch {
+      counts.skipped += 1;
+      return;
+    }
+    if (!remote) {
+      counts.skipped += 1;
+      return;
+    }
+    if (!existingFile) {
+      await this.downloadRemoteFileToVault(vaultPath, remote);
+      const downloaded = this.getVaultFileByPath(vaultPath);
+      if (downloaded) {
+        this.syncIndex.set(vaultPath, {
+          localSignature: await this.buildCurrentLocalSignature(downloaded),
+          remoteSignature: remote.signature,
+          remotePath
+        });
+      }
+      counts.downloadedRemote += 1;
+      return;
+    }
+    const currentSig = await this.buildCurrentLocalSignature(existingFile);
+    const indexed = this.syncIndex.get(vaultPath);
+    const localUnchanged = indexed && currentSig === indexed.localSignature;
+    if (localUnchanged) {
+      await this.downloadRemoteFileToVault(vaultPath, remote, existingFile);
+      this.syncIndex.set(vaultPath, {
+        localSignature: await this.buildCurrentLocalSignature(existingFile),
+        remoteSignature: remote.signature,
+        remotePath
+      });
+      counts.downloadedRemote += 1;
+      return;
+    }
+    await this.createLocalConflictCopy(existingFile, void 0, "remote");
+    counts.conflicts += 1;
+  }
+  async replayRemoteDelete(event, counts) {
+    const vaultPath = this.syncSupport.remotePathToVaultPath(event.remotePath);
+    if (!vaultPath || this.syncSupport.shouldSkipContentSyncPath(vaultPath)) {
+      counts.skipped += 1;
+      return;
+    }
+    const existingFile = this.getVaultFileByPath(vaultPath);
+    if (!existingFile) {
+      counts.skipped += 1;
+      return;
+    }
+    const currentSig = await this.buildCurrentLocalSignature(existingFile);
+    const indexed = this.syncIndex.get(vaultPath);
+    const localUnchanged = indexed && currentSig === indexed.localSignature;
+    if (!localUnchanged) {
+      counts.conflicts += 1;
+      return;
+    }
+    let tombstone = null;
+    if (event.tombstonePath) {
+      try {
+        const response = await this.requestUrl({
+          url: this.buildUploadUrl(event.tombstonePath),
+          method: "GET"
+        });
+        tombstone = this.syncSupport.parseDeletionTombstonePayload(this.decodeUtf8(response.arrayBuffer));
+      } catch {}
+    }
+    if (tombstone && this.syncSupport.isTombstoneAuthoritative(tombstone, { remotePath: event.remotePath, lastModified: 0, size: 0, signature: event.remoteSignature })) {
+      await this.removeLocalVaultFile(existingFile);
+      this.syncIndex.delete(vaultPath);
+      counts.deletedRemoteFiles += 1;
+    } else {
+      counts.skipped += 1;
+    }
+  }
+  async replayRemoteRename(event, counts) {
+    const oldVaultPath = this.syncSupport.remotePathToVaultPath(event.remotePath || "");
+    const newVaultPath = event.newPath ? this.syncSupport.remotePathToVaultPath(
+      this.syncSupport.buildVaultSyncRemotePath(event.newPath)
+    ) : null;
+    if (newVaultPath && this.syncSupport.shouldSkipContentSyncPath(newVaultPath)) {
+      counts.skipped += 1;
+      return;
+    }
+    if (oldVaultPath) {
+      const oldFile = this.getVaultFileByPath(oldVaultPath);
+      if (oldFile) {
+        const currentSig = await this.buildCurrentLocalSignature(oldFile);
+        const indexed = this.syncIndex.get(oldVaultPath);
+        const localUnchanged = indexed && currentSig === indexed.localSignature;
+        if (localUnchanged) {
+          await this.removeLocalVaultFile(oldFile);
+          this.syncIndex.delete(oldVaultPath);
+        } else {
+          counts.conflicts += 1;
+        }
+      }
+    }
+    if (newVaultPath) {
+      const newRemotePath = this.syncSupport.buildVaultSyncRemotePath(event.newPath);
+      let remote;
+      try {
+        remote = await this.statRemoteFile(newRemotePath);
+      } catch {
+        remote = null;
+      }
+      if (remote) {
+        const newFile = this.getVaultFileByPath(newVaultPath);
+        if (!newFile) {
+          await this.downloadRemoteFileToVault(newVaultPath, remote);
+          const downloaded = this.getVaultFileByPath(newVaultPath);
+          if (downloaded) {
+            this.syncIndex.set(newVaultPath, {
+              localSignature: await this.buildCurrentLocalSignature(downloaded),
+              remoteSignature: remote.signature,
+              remotePath: newRemotePath
+            });
+          }
+          counts.downloadedRemote += 1;
+        }
+      }
+    }
   }
   async createLocalConflictCopy(file, markdownContent, label) {
     const existing = this.findExistingConflictCopyPath(file.path);
@@ -2140,6 +2521,78 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       }
     }
     return tombstones;
+  }
+  async ensureRemoteEventFolder() {
+    const eventFolder = this.syncSupport.buildRemoteEventFolder();
+    await this.ensureRemoteDirectories([eventFolder]);
+  }
+  async writeRemoteSyncEvent(event) {
+    const eventFolder = this.syncSupport.buildRemoteEventFolder();
+    const eventFileName = `${event.id}.json`;
+    const eventRemotePath = `${eventFolder}${eventFileName}`;
+    const payload = JSON.stringify({
+      id: event.id,
+      clientId: this.clientId,
+      kind: event.kind,
+      scope: "vault-content",
+      occurredAt: event.occurredAt || Date.now(),
+      path: event.path,
+      oldPath: event.oldPath,
+      newPath: event.newPath,
+      remotePath: event.remotePath,
+      remoteSignature: event.remoteSignature,
+      localSignature: event.localSignature,
+      tombstonePath: event.tombstonePath,
+      source: event.source || "local-sync",
+      version: 1
+    });
+    try {
+      await this.ensureRemoteEventFolder();
+      await this.requestUrl({
+        url: this.buildUploadUrl(eventRemotePath),
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: this.encodeUtf8(payload)
+      });
+    } catch (writeError) {
+      console.warn("Failed to write remote sync event (non-fatal):", writeError);
+      this.pendingRemoteEventWrites.push(event);
+    }
+  }
+  async listRecentRemoteSyncEvents(limit) {
+    const eventFolder = this.syncSupport.buildRemoteEventFolder();
+    let listing;
+    try {
+      listing = await this.listRemoteDirectory(eventFolder);
+    } catch {
+      return [];
+    }
+    const fileEntries = listing.filter((entry) => !entry.isCollection && entry.remotePath.endsWith(".json"));
+    fileEntries.sort((a, b) => {
+      const ta = a.file?.lastModified ?? 0;
+      const tb = b.file?.lastModified ?? 0;
+      return tb - ta;
+    });
+    const candidates = fileEntries.slice(0, limit * 2);
+    const events = [];
+    for (const entry of candidates) {
+      if (events.length >= limit) break;
+      try {
+        const response = await this.requestUrl({
+          url: this.buildUploadUrl(entry.remotePath),
+          method: "GET"
+        });
+        const raw = JSON.parse(this.decodeUtf8(response.arrayBuffer));
+        if (!raw || typeof raw !== "object" || !raw.id || !raw.kind) continue;
+        if (raw.clientId === this.clientId) continue;
+        if (this.appliedRemoteEventIds.has(raw.id)) continue;
+        events.push(raw);
+      } catch {
+        continue;
+      }
+    }
+    events.sort((a, b) => (b.occurredAt ?? 0) - (a.occurredAt ?? 0));
+    return events.slice(0, limit);
   }
   getVaultFileByPath(path) {
     const file = this.app.vault.getAbstractFileByPath(path);
@@ -3277,6 +3730,20 @@ var SecureWebdavSettingTab = class extends import_obsidian4.PluginSettingTab {
         const parsed = Number.parseInt(value, 10);
         if (!Number.isNaN(parsed)) {
           this.plugin.settings.autoSyncIntervalMinutes = Math.max(0, parsed);
+          await this.plugin.saveSettings();
+        }
+      })
+    );
+    new import_obsidian4.Setting(containerEl).setName(this.plugin.t("\u5FEB\u901F\u540C\u6B65\u4E8B\u4EF6\u6570\u91CF", "Fast sync event limit")).setDesc(
+      this.plugin.t(
+        "\u5FEB\u901F\u540C\u6B65\u53EA\u5904\u7406\u6700\u8FD1 N \u6761\u771F\u5B9E\u53D8\u66F4\u4E8B\u4EF6\uFF08\u5305\u542B\u65B0\u589E\u3001\u4FEE\u6539\u3001\u5220\u9664\u3001\u91CD\u547D\u540D\uFF09\u3002\u8303\u56F4 10-20\uFF0C\u9ED8\u8BA4 20\u3002\u5B8C\u6574\u540C\u6B65\u4ECD\u7528\u4E8E\u5168\u91CF\u5BF9\u8D26\u4E0E\u4FEE\u590D\u3002",
+        "Fast sync only processes the most recent N real change events (create, modify, delete, rename). Range 10-20, default 20. Full sync remains available for complete reconciliation."
+      )
+    ).addText(
+      (text) => text.setPlaceholder("20").setValue(String(this.plugin.settings.fastSyncRecentChangeLimit)).onChange(async (value) => {
+        const parsed = Number.parseInt(value, 10);
+        if (!Number.isNaN(parsed)) {
+          this.plugin.settings.fastSyncRecentChangeLimit = Math.max(10, Math.min(20, parsed));
           await this.plugin.saveSettings();
         }
       })
