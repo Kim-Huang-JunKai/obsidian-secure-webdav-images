@@ -1697,8 +1697,9 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
   }
   async uploadBinary(remotePath, binary, mimeType) {
     await this.ensureRemoteDirectories(remotePath);
+    const url = this.buildUploadUrl(remotePath);
     const response = await this.requestUrl({
-      url: this.buildUploadUrl(remotePath),
+      url,
       method: "PUT",
       headers: {
         Authorization: this.buildAuthHeader(),
@@ -1706,7 +1707,9 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       },
       body: binary
     });
-    this.assertResponseSuccess(response, "Upload");
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`Upload failed with status ${response.status} for ${remotePath}`);
+    }
   }
   async handleEditorPaste(evt, editor, info) {
     if (evt.defaultPrevented || !info.file) {
@@ -2171,6 +2174,16 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       }
       const remotePath = this.syncSupport.buildVaultSyncRemotePath(file.path);
       const previous = this.syncIndex.get(path);
+      const localSignature = await this.buildCurrentLocalSignature(file, markdownContent);
+      if (previous && !this.syncSupport.isLegacySignature(previous.localSignature) && previous.localSignature === localSignature && previous.remotePath === remotePath) {
+        let remote2;
+        try { remote2 = await this.statRemoteFile(remotePath); } catch { remote2 = null; }
+        if (remote2 && this.syncSupport.buildRemoteSyncSignature(remote2) === previous.remoteSignature) {
+          this.pendingVaultSyncPaths.delete(path);
+          counts.skipped += 1;
+          continue;
+        }
+      }
       let remote;
       try { remote = await this.statRemoteFile(remotePath); } catch { remote = null; }
       if (remote && previous && remote.lastModified > (previous.remoteSignature?.split(":")[0] || 0)) {
@@ -2179,16 +2192,20 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
           counts.downloadedRemote += 1;
         }
       }
-      const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent);
-      const localSignature = await this.buildCurrentLocalSignature(file, markdownContent);
-      this.syncIndex.set(file.path, {
-        localSignature,
-        remoteSignature: uploadedRemote.signature,
-        remotePath
-      });
-      await this.deleteDeletionTombstone(file.path);
-      this.pendingVaultSyncPaths.delete(path);
-      counts.uploaded += 1;
+      try {
+        const uploadedRemote = await this.uploadContentFileToRemote(file, remotePath, markdownContent);
+        this.syncIndex.set(file.path, {
+          localSignature,
+          remoteSignature: uploadedRemote.signature,
+          remotePath
+        });
+        await this.deleteDeletionTombstone(file.path);
+        this.pendingVaultSyncPaths.delete(path);
+        counts.uploaded += 1;
+      } catch (uploadError) {
+        console.error(`Upload failed for ${path}:`, uploadError);
+        counts.skipped += 1;
+      }
       const recentMutation = this.recentVaultMutations.find((m) => m.path === path && (m.kind === "create" || m.kind === "modify") && m.status === "pending");
       if (recentMutation) {
         recentMutation.status = "applied";
@@ -3338,7 +3355,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
           Authorization: this.buildAuthHeader()
         }
       });
-      if (![200, 201, 204, 207, 301, 302, 307, 308, 405].includes(response.status)) {
+      if (![200, 201, 204, 207, 301, 302, 307, 308, 403, 405].includes(response.status)) {
         throw new Error(`MKCOL failed for ${current} with status ${response.status}`);
       }
     }
