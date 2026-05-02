@@ -459,16 +459,16 @@ var SecureWebdavSyncSupport = class {
     return this.deps.app.vault.getFiles().filter((file) => !this.shouldSkipContentSyncPath(file.path)).sort((a, b) => a.path.localeCompare(b.path));
   }
   buildSyncSignature(file) {
-    return `${file.stat.ctime}:${file.stat.mtime}:${file.stat.size}`;
+    return `${file.stat.mtime}:${file.stat.size}`;
   }
   buildRemoteSyncSignature(remote) {
-    return `${remote.creationTime || 0}:${remote.lastModified}:${remote.size}`;
+    return `${remote.lastModified}:${remote.size}`;
   }
   isLegacySignature(sig) {
     if (typeof sig !== "string" || !sig) return true;
     const parts = sig.split(":");
-    if (parts.length !== 3) return true;
-    return !parts.every((p) => /^\d+$/.test(p));
+    if (parts.length === 2 && parts.every((p) => /^\d+$/.test(p))) return false;
+    return true;
   }
   buildVaultSyncRemotePath(vaultPath) {
     return `${this.normalizeFolder(this.deps.getVaultSyncRemoteFolder())}${vaultPath}`;
@@ -2703,8 +2703,8 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       if (legacyLocal || legacyRemote) {
         const localParts = localSignature.split(":");
         const remoteParts = remoteSignature.split(":");
-        const sameSize = localParts[2] === remoteParts[2];
-        const sameMtime = localParts[1] === remoteParts[1];
+        const sameMtime = localParts[0] === remoteParts[0];
+        const sameSize = localParts[1] === remoteParts[1];
         if (sameSize && sameMtime) {
           this.syncIndex.set(file.path, { localSignature, remoteSignature, remotePath });
           counts.skipped += 1;

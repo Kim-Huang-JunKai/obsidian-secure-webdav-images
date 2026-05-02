@@ -93,13 +93,12 @@ function installMarkdownLeaf(app, file, editor) {
 
 function createRemoteFileState(remotePath, body, lastModified = Date.now(), creationTime) {
   const binary = body instanceof ArrayBuffer ? body.slice(0) : new TextEncoder().encode(String(body)).buffer;
-  const ctime = creationTime || lastModified;
   return {
     remotePath,
     lastModified,
-    creationTime: ctime,
+    creationTime: creationTime || lastModified,
     size: binary.byteLength,
-    signature: `${ctime}:${lastModified}:${binary.byteLength}`,
+    signature: `${lastModified}:${binary.byteLength}`,
     body: binary,
   };
 }
