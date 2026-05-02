@@ -675,6 +675,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       getVaultSyncRemoteFolder: () => this.settings.vaultSyncRemoteFolder,
       getExcludedSyncFolders: () => this.settings.excludedSyncFolders ?? [],
       deletionFolderSuffix: this.deletionFolderSuffix,
+      trashFolderSuffix: this.trashFolderSuffix,
       eventFolderSuffix: this.eventFolderSuffix,
       encodeBase64Url: (value) => this.arrayBufferToBase64(this.encodeUtf8(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, ""),
       decodeBase64Url: (value) => {
