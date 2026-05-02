@@ -27,6 +27,7 @@ class TFile extends TAbstractFile {
     this.basename = this.extension ? this.name.slice(0, -(this.extension.length + 1)) : this.name;
     this.stat = {
       mtime: options.mtime ?? Date.now(),
+      ctime: options.ctime ?? options.mtime ?? Date.now(),
       size: options.size ?? 0,
     };
     this.content = content;
@@ -235,8 +236,10 @@ class MockVault {
   async modify(file, content, options = {}) {
     file.content = content;
     file.binary = null;
+    const oldCtime = file.stat?.ctime;
     file.stat = {
       mtime: options.mtime ?? Date.now(),
+      ctime: oldCtime ?? options.mtime ?? Date.now(),
       size: Buffer.byteLength(content, "utf8"),
     };
   }
@@ -244,8 +247,10 @@ class MockVault {
   async modifyBinary(file, binary, options = {}) {
     file.binary = binary.slice(0);
     file.content = "";
+    const oldCtime = file.stat?.ctime;
     file.stat = {
       mtime: options.mtime ?? Date.now(),
+      ctime: oldCtime ?? options.mtime ?? Date.now(),
       size: binary.byteLength,
     };
   }

@@ -459,10 +459,10 @@ var SecureWebdavSyncSupport = class {
     return this.deps.app.vault.getFiles().filter((file) => !this.shouldSkipContentSyncPath(file.path)).sort((a, b) => a.path.localeCompare(b.path));
   }
   buildSyncSignature(file) {
-    return `${file.stat.mtime}:${file.stat.size}`;
+    return `${file.stat.ctime}:${file.stat.mtime}:${file.stat.size}`;
   }
   buildRemoteSyncSignature(remote) {
-    return `${remote.lastModified}:${remote.size}`;
+    return `${remote.creationTime || 0}:${remote.lastModified}:${remote.size}`;
   }
   buildVaultSyncRemotePath(vaultPath) {
     return `${this.normalizeFolder(this.deps.getVaultSyncRemoteFolder())}${vaultPath}`;
@@ -511,7 +511,8 @@ var SecureWebdavSyncSupport = class {
       return {
         path: parsed.path,
         deletedAt: parsed.deletedAt,
-        remoteSignature: parsed.remoteSignature
+        remoteSignature: parsed.remoteSignature,
+        creationTime: parsed.creationTime || 0
       };
     } catch {
       return null;
@@ -528,18 +529,26 @@ var SecureWebdavSyncSupport = class {
     return remoteMtime > localMtime + 2e3;
   }
   isTombstoneAuthoritative(tombstone, remote) {
-    const graceMs = 5e3;
     if (!remote) {
       return true;
+    }
+    if (tombstone.creationTime && remote.creationTime) {
+      if (tombstone.creationTime !== remote.creationTime) {
+        return false;
+      }
     }
     if (tombstone.remoteSignature) {
       return remote.signature === tombstone.remoteSignature;
     }
-    return remote.lastModified <= tombstone.deletedAt + graceMs;
+    return remote.lastModified <= tombstone.deletedAt + 5e3;
   }
   shouldDeleteLocalFromTombstone(file, tombstone) {
-    const graceMs = 5e3;
-    return file.stat.mtime <= tombstone.deletedAt + graceMs;
+    if (tombstone.creationTime && file.stat.ctime) {
+      if (Math.abs(tombstone.creationTime - file.stat.ctime) > 5e3) {
+        return false;
+      }
+    }
+    return file.stat.mtime <= tombstone.deletedAt + 5e3;
   }
   normalizeFolder(input) {
     return normalizeFolder(input);
@@ -1176,7 +1185,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         remotePath: indexed?.remotePath,
         remoteSignature: indexed?.remoteSignature
       });
-      this.markPendingVaultDeletion(file.path);
+      this.markPendingVaultDeletion(file.path, file.stat?.ctime);
       this.syncIndex.delete(file.path);
       await this.savePluginState();
     }
@@ -1227,7 +1236,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     this.pendingVaultDeletionPaths.delete(path);
     this.pendingVaultSyncPaths.add(path);
   }
-  markPendingVaultDeletion(path) {
+  markPendingVaultDeletion(path, creationTime) {
     if (this.syncSupport.shouldSkipContentSyncPath(path)) {
       this.pendingVaultSyncPaths.delete(path);
       this.pendingVaultDeletionPaths.delete(path);
@@ -1237,7 +1246,8 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     this.pendingVaultSyncPaths.delete(path);
     this.pendingVaultDeletionPaths.set(path, {
       remotePath: existing?.remotePath ?? this.syncSupport.buildVaultSyncRemotePath(path),
-      remoteSignature: existing?.remoteSignature
+      remoteSignature: existing?.remoteSignature,
+      creationTime: creationTime || 0
     });
   }
   findPendingVaultRenameByNewPath(newPath) {
@@ -1909,8 +1919,10 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       const remoteInventory = await this.listRemoteTree(this.settings.vaultSyncRemoteFolder);
       const deletionTombstones = await this.readDeletionTombstones();
       const remoteFiles = remoteInventory.files;
+      const reconcileCounts = { uploaded: 0, deletedRemoteFiles: 0, skipped: 0, detectedLocalChanges: 0, downloadedRemote: 0, conflicts: 0 };
+      await this.reconcileRemoteAndLocal(reconcileCounts, deletionTombstones);
+      counts.downloadedOrUpdated += reconcileCounts.downloadedRemote;
       await this.reconcileOrphanedSyncEntries(remoteFiles, deletionTombstones, counts);
-      await this.reconcileRemoteOnlyFiles(remoteFiles, deletionTombstones, counts);
       await this.reconcileLocalFiles(remoteFiles, deletionTombstones, counts);
       const dirStats = await this.reconcileDirectories(remoteInventory.directories);
       counts.deletedRemoteDirectories = dirStats.deletedRemote;
@@ -1961,9 +1973,6 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       const limit = this.settings.fastSyncRecentChangeLimit;
       const remoteEvents = await this.listRecentRemoteSyncEvents(limit);
       await this.replayRemoteSyncEvents(remoteEvents, counts);
-      if (remoteEvents.length === 0) {
-        await this.detectRemoteChangesBySignature(counts);
-      }
       await this.processPendingVaultRenames(counts);
       await this.processPendingVaultDeletions(counts);
       await this.processPendingVaultUploads(counts);
@@ -2115,7 +2124,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
           continue;
         }
       }
-      await this.writeDeletionTombstone(path, entry.remoteSignature);
+      await this.writeDeletionTombstone(path, entry.remoteSignature, entry.creationTime);
       await this.moveRemoteFileToTrash(path, entry.remotePath, entry.remoteSignature);
       this.syncIndex.delete(path);
       this.pendingVaultDeletionPaths.delete(path);
@@ -2313,43 +2322,71 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       }
     }
   }
-  async detectRemoteChangesBySignature(counts) {
-    const allPaths = [...this.syncIndex.keys()];
-    if (allPaths.length === 0) return;
-    for (const vaultPath of allPaths) {
-      if (this.syncSupport.shouldSkipContentSyncPath(vaultPath)) continue;
-      if (this.pendingVaultSyncPaths.has(vaultPath)) continue;
-      const entry = this.syncIndex.get(vaultPath);
-      if (!entry || !entry.remotePath) continue;
-      try {
-        const resp = await this.requestUrl({
-          url: this.buildUploadUrl(entry.remotePath),
-          method: "HEAD",
-          headers: { Authorization: this.buildAuthHeader() }
-        });
-        if (resp.status === 404) {
+  async reconcileRemoteAndLocal(counts, deletionTombstones = new Map()) {
+    const remoteFolder = this.normalizeFolder(this.settings.vaultSyncRemoteFolder);
+    let remoteFiles;
+    try {
+      const inventory = await this.listRemoteTree(remoteFolder);
+      remoteFiles = inventory.files;
+    } catch {
+      return;
+    }
+    const localFiles = this.syncSupport.collectVaultContentFiles();
+    const localPathsSet = new Set(localFiles.map((f) => f.path));
+    const indexedRemotePaths = new Set();
+    for (const [, entry] of this.syncIndex.entries()) {
+      if (entry.remotePath) indexedRemotePaths.add(entry.remotePath);
+    }
+    for (const [remotePath, remote] of remoteFiles.entries()) {
+      const vaultPath = this.syncSupport.remotePathToVaultPath(remotePath);
+      if (!vaultPath || this.syncSupport.shouldSkipContentSyncPath(vaultPath)) continue;
+      if (remotePath.includes("/.__secure-webdav-")) continue;
+      const localFile = this.getVaultFileByPath(vaultPath);
+      const previous = this.syncIndex.get(vaultPath);
+      const remoteSig = this.syncSupport.buildRemoteSyncSignature(remote);
+      if (previous && previous.remoteSignature === remoteSig) continue;
+      if (!localFile && !localPathsSet.has(vaultPath)) {
+        const tombstone = deletionTombstones.get(vaultPath);
+        if (tombstone && this.syncSupport.isTombstoneAuthoritative(tombstone, remote)) {
+          await this.deleteRemoteContentFile(remotePath);
+          remoteFiles.delete(remotePath);
+          counts.deletedRemoteFiles += 1;
           continue;
         }
-        if (resp.status !== 200) continue;
-        const lastModified = resp.headers["last-modified"] || resp.headers["Last-Modified"] || "";
-        const contentLength = resp.headers["content-length"] || resp.headers["Content-Length"] || "0";
-        const remoteSig = `${new Date(lastModified).getTime() || 0}:${contentLength}`;
-        if (remoteSig === entry.remoteSignature) continue;
-        const localFile = this.getVaultFileByPath(vaultPath);
-        const remoteTime = new Date(lastModified).getTime() || 0;
-        const localTime = localFile ? localFile.stat.mtime : 0;
-        if (remoteTime > localTime) {
-          await this.downloadRemoteFileToVault(vaultPath, { remotePath: entry.remotePath }, localFile);
-          const updatedFile = this.getVaultFileByPath(vaultPath);
-          if (updatedFile) {
-            const newLocalSig = await this.buildCurrentLocalSignature(updatedFile);
-            this.syncIndex.set(vaultPath, { remotePath: entry.remotePath, localSignature: newLocalSig, remoteSignature: remoteSig });
+        try {
+          await this.downloadRemoteFileToVault(vaultPath, { remotePath }, null);
+          const downloaded = this.getVaultFileByPath(vaultPath);
+          if (downloaded) {
+            const localSig = await this.buildCurrentLocalSignature(downloaded);
+            this.syncIndex.set(vaultPath, { remotePath, localSignature: localSig, remoteSignature: remoteSig });
           }
           counts.downloadedRemote += 1;
-        }
-      } catch {
+        } catch {}
         continue;
       }
+      if (localFile) {
+        const localSig = await this.buildCurrentLocalSignature(localFile);
+        if (previous && previous.localSignature === localSig) {
+          if (remote.lastModified > localFile.stat.mtime) {
+            try {
+              await this.downloadRemoteFileToVault(vaultPath, { remotePath }, localFile);
+              const updated = this.getVaultFileByPath(vaultPath);
+              if (updated) {
+                const newSig = await this.buildCurrentLocalSignature(updated);
+                this.syncIndex.set(vaultPath, { remotePath, localSignature: newSig, remoteSignature: remoteSig });
+              }
+              counts.downloadedRemote += 1;
+            } catch {}
+          }
+        }
+      }
+    }
+    for (const file of localFiles) {
+      if (this.pendingVaultSyncPaths.has(file.path)) continue;
+      if (this.syncIndex.has(file.path)) continue;
+      const remotePath = this.syncSupport.buildVaultSyncRemotePath(file.path);
+      if (remoteFiles.has(remotePath)) continue;
+      this.pendingVaultSyncPaths.add(file.path);
     }
   }
   async replaySingleRemoteEvent(event, counts) {
@@ -2700,11 +2737,12 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     await this.uploadBinary(trashMetaPath, this.encodeUtf8(meta), "application/json; charset=utf-8");
     await this.deleteRemoteContentFile(remotePath);
   }
-  async writeDeletionTombstone(vaultPath, remoteSignature) {
+  async writeDeletionTombstone(vaultPath, remoteSignature, creationTime) {
     const payload = {
       path: vaultPath,
       deletedAt: Date.now(),
-      remoteSignature
+      remoteSignature,
+      creationTime: creationTime || 0
     };
     await this.uploadBinary(
       this.syncSupport.buildDeletionRemotePath(vaultPath),
@@ -3081,12 +3119,7 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     return await this.app.vault.read(file);
   }
   async buildCurrentLocalSignature(file, markdownContent) {
-    if (file.extension !== "md") {
-      return this.syncSupport.buildSyncSignature(file);
-    }
-    const content = markdownContent ?? await this.readMarkdownContentPreferEditor(file);
-    const digest = (await this.computeSha256Hex(this.encodeUtf8(content))).slice(0, 16);
-    return `md:${content.length}:${digest}`;
+    return this.syncSupport.buildSyncSignature(file);
   }
   async reconcileRemoteImages() {
     return { deletedFiles: 0, deletedDirectories: 0 };
