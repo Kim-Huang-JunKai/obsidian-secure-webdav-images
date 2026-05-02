@@ -464,6 +464,12 @@ var SecureWebdavSyncSupport = class {
   buildRemoteSyncSignature(remote) {
     return `${remote.creationTime || 0}:${remote.lastModified}:${remote.size}`;
   }
+  isLegacySignature(sig) {
+    if (typeof sig !== "string" || !sig) return true;
+    const parts = sig.split(":");
+    if (parts.length !== 3) return true;
+    return !parts.every((p) => /^\d+$/.test(p));
+  }
   buildVaultSyncRemotePath(vaultPath) {
     return `${this.normalizeFolder(this.deps.getVaultSyncRemoteFolder())}${vaultPath}`;
   }
@@ -2345,6 +2351,9 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       const previous = this.syncIndex.get(vaultPath);
       const remoteSig = this.syncSupport.buildRemoteSyncSignature(remote);
       if (previous && previous.remoteSignature === remoteSig) continue;
+      if (previous && this.syncSupport.isLegacySignature(previous.remoteSignature)) {
+        continue;
+      }
       if (!localFile && !localPathsSet.has(vaultPath)) {
         const tombstone = deletionTombstones.get(vaultPath);
         if (tombstone && this.syncSupport.isTombstoneAuthoritative(tombstone, remote)) {
@@ -2378,6 +2387,8 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
               counts.downloadedRemote += 1;
             } catch {}
           }
+        } else if (previous && this.syncSupport.isLegacySignature(previous.localSignature)) {
+          this.syncIndex.set(vaultPath, { ...previous, localSignature: localSig });
         }
       }
     }
@@ -2433,7 +2444,8 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     const currentSig = await this.buildCurrentLocalSignature(existingFile);
     const indexed = this.syncIndex.get(vaultPath);
     const localUnchanged = indexed && currentSig === indexed.localSignature;
-    if (localUnchanged) {
+    const legacyMigration = indexed && this.syncSupport.isLegacySignature(indexed.localSignature);
+    if (localUnchanged || legacyMigration) {
       await this.downloadRemoteFileToVault(vaultPath, remote, existingFile);
       this.syncIndex.set(vaultPath, {
         localSignature: await this.buildCurrentLocalSignature(existingFile),
@@ -2460,7 +2472,8 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
     const currentSig = await this.buildCurrentLocalSignature(existingFile);
     const indexed = this.syncIndex.get(vaultPath);
     const localUnchanged = indexed && currentSig === indexed.localSignature;
-    if (!localUnchanged) {
+    const legacyMigration = indexed && this.syncSupport.isLegacySignature(indexed.localSignature);
+    if (!localUnchanged && !legacyMigration) {
       counts.conflicts += 1;
       return;
     }
@@ -2497,7 +2510,8 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         const currentSig = await this.buildCurrentLocalSignature(oldFile);
         const indexed = this.syncIndex.get(oldVaultPath);
         const localUnchanged = indexed && currentSig === indexed.localSignature;
-        if (localUnchanged) {
+        const legacyMigration = indexed && this.syncSupport.isLegacySignature(indexed.localSignature);
+        if (localUnchanged || legacyMigration) {
           await this.removeLocalVaultFile(oldFile);
           this.syncIndex.delete(oldVaultPath);
         } else {
@@ -2657,6 +2671,8 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
       }
       const localChanged = previous.localSignature !== localSignature || previous.remotePath !== remotePath;
       const remoteChanged = previous.remoteSignature !== remoteSignature || previous.remotePath !== remotePath;
+      const legacyLocal = this.syncSupport.isLegacySignature(previous.localSignature);
+      const legacyRemote = this.syncSupport.isLegacySignature(previous.remoteSignature);
       if (!localChanged && !remoteChanged) {
         counts.skipped += 1;
         continue;
@@ -2684,11 +2700,54 @@ var SecureWebdavImagesPlugin = class extends import_obsidian4.Plugin {
         counts.uploaded += 1;
         continue;
       }
+      if (legacyLocal || legacyRemote) {
+        const localParts = localSignature.split(":");
+        const remoteParts = remoteSignature.split(":");
+        const sameSize = localParts[2] === remoteParts[2];
+        const sameMtime = localParts[1] === remoteParts[1];
+        if (sameSize && sameMtime) {
+          this.syncIndex.set(file.path, { localSignature, remoteSignature, remotePath });
+          counts.skipped += 1;
+          continue;
+        }
+      }
       await this.createLocalConflictCopy(file, markdownContent, "local");
       counts.skipped += 1;
       continue;
     }
     return localRemotePaths;
+  }
+  async purgeDuplicateConflictCopies() {
+    const files = this.app.vault.getFiles();
+    const conflictFiles = files.filter((f) => /\.sync-conflict-/.test(f.path));
+    if (conflictFiles.length === 0) return 0;
+    let purged = 0;
+    for (const conflict of conflictFiles) {
+      const normalized = (0, import_obsidian4.normalizePath)(conflict.path);
+      const slashIndex = normalized.lastIndexOf("/");
+      const dir = slashIndex >= 0 ? normalized.slice(0, slashIndex + 1) : "";
+      const name = slashIndex >= 0 ? normalized.slice(slashIndex + 1) : normalized;
+      const dotIndex = name.lastIndexOf(".");
+      const ext = dotIndex > 0 ? name.slice(dotIndex) : "";
+      const conflictMarker = name.indexOf(".sync-conflict-");
+      if (conflictMarker <= 0) continue;
+      const originalName = name.slice(0, conflictMarker) + ext;
+      const originalPath = dir + originalName;
+      const originalFile = this.app.vault.getAbstractFileByPath(originalPath);
+      if (!(originalFile instanceof import_obsidian4.TFile)) continue;
+      try {
+        const conflictContent = await this.app.vault.read(conflict);
+        const originalContent = await this.app.vault.read(originalFile);
+        if (conflictContent === originalContent) {
+          await this.app.vault.delete(conflict);
+          this.syncIndex.delete(conflict.path);
+          purged += 1;
+        }
+      } catch {
+        continue;
+      }
+    }
+    return purged;
   }
   async deleteRemoteContentFile(remotePath) {
     try {
